@@ -13,7 +13,7 @@
     header h1 { margin:0; font-size:20px; letter-spacing: .3px; }
     header .badge { padding:4px 8px; border-radius: 999px; background: #203055; color:#b7cdfb; font-size:12px; }
     .panel { background: rgba(20,27,45,.9); border:1px solid #2a3a63; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,.25); overflow: hidden; }
-    .form { display:grid; grid-template-columns: 1fr 140px 140px 120px 100px 100px; gap:10px; padding:16px; border-bottom:1px dashed #2a3a63; }
+    .form { display:grid; grid-template-columns: 1fr 140px 140px 140px 120px 100px 100px; gap:10px; padding:16px; border-bottom:1px dashed #2a3a63; }
     .form input, .form select, .form button { height:38px; border-radius:10px; border:1px solid #33446f; background:#0f1527; color:var(--text); padding:0 12px; outline:none; }
     .form input::placeholder { color:#98a3bf80; }
     .form button { background: linear-gradient(180deg, #2a63ff, #2052d6); border:0; font-weight:600; cursor:pointer; }
@@ -58,6 +58,7 @@
         <input id="q" placeholder="输入故障现象，如：刹车发软 车身发飘" />
         <input id="system" placeholder="系统（可选）如：制动" />
         <input id="part" placeholder="部件（可选）如：制动踏板" />
+        <input id="vehicletype" placeholder="车型（可选）如：CT4" />
         <input id="fault_code" placeholder="故障码（可选）如：P0300" />
         <select id="topn">
           <option value="3">Top-3</option>
@@ -71,6 +72,7 @@
       </form>
 
       <div class="options">
+        <label><input type="checkbox" id="use_decision" checked /> 返回灰区决策信息</label>
         <label><input type="checkbox" id="use_semantic" checked /> 启用语义向量检索</label>
         <label>语义权重
           <input type="range" id="semantic_weight" min="0.30" max="0.90" step="0.05" value="0.60" />
@@ -118,29 +120,31 @@
     };
 
     const EXAMPLES = [
-      {q:"发动机无法启动", system:"发动机", part:"启动系统", fault_code:""},
-      {q:"变速器挂D档延迟", system:"变速箱/传动", part:"变速器", fault_code:""},
-      {q:"刹车发软 制动距离长", system:"制动", part:"制动系统", fault_code:""},
-      {q:"发动机故障灯亮", system:"发动机", part:"发动机控制", fault_code:"P0300"},
-      {q:"怠速不稳 抖动", system:"发动机", part:"怠速控制", fault_code:"P0171"},
-      {q:"ABS故障", system:"制动", part:"ABS系统", fault_code:"C1234"},
+      {q:"发动机无法启动", system:"发动机", part:"启动系统", vehicletype:"", fault_code:""},
+      {q:"变速器挂D档延迟", system:"变速箱/传动", part:"变速器", vehicletype:"", fault_code:""},
+      {q:"刹车发软 制动距离长", system:"制动", part:"制动系统", vehicletype:"", fault_code:""},
+      {q:"发动机故障灯亮", system:"发动机", part:"发动机控制", vehicletype:"", fault_code:"P0300"},
+      {q:"怠速不稳 抖动", system:"发动机", part:"怠速控制", vehicletype:"", fault_code:"P0171"},
+      {q:"ABS故障", system:"制动", part:"ABS系统", vehicletype:"", fault_code:"C1234"},
     ];
 
     const exWrap = document.getElementById('examples');
     EXAMPLES.forEach(e=>{
       const b = document.createElement('button');
       b.textContent = `${e.q}（${e.system}/${e.part}）`;
-      b.onclick = ()=>{ q.value=e.q; system.value=e.system; part.value=e.part; fault_code.value=e.fault_code; runQuery(); };
+      b.onclick = ()=>{ q.value=e.q; system.value=e.system; part.value=e.part; vehicletype.value=e.vehicletype || ""; fault_code.value=e.fault_code; runQuery(); };
       exWrap.appendChild(b);
     });
 
     const q = document.getElementById('q');
     const system = document.getElementById('system');
     const part = document.getElementById('part');
+    const vehicletype = document.getElementById('vehicletype');
     const fault_code = document.getElementById('fault_code');
     const topn = document.getElementById('topn');
     const runBtn = document.getElementById('run');
     const resetBtn = document.getElementById('reset');
+    const useDecision = document.getElementById('use_decision');
     const useSemantic = document.getElementById('use_semantic');
     const semanticWeight = document.getElementById('semantic_weight');
     const semanticWeightValue = document.getElementById('semantic_weight_value');
@@ -155,7 +159,8 @@
       semanticWeightValue.textContent = Number(semanticWeight.value).toFixed(2);
     });
     resetBtn.addEventListener('click', ()=>{
-      q.value = ""; system.value=""; part.value=""; fault_code.value="";
+      q.value = ""; system.value=""; part.value=""; vehicletype.value=""; fault_code.value="";
+      useDecision.checked = true;
       useSemantic.checked = true;
       semanticWeight.value = 0.60; semanticWeightValue.textContent = "0.60";
       vectorK.value = 50;
@@ -222,7 +227,7 @@
       const requestBody = {
         q: qv,
         size: parseInt(topn.value),
-        use_decision: true,
+        use_decision: useDecision.checked,
         use_semantic: useSemantic.checked,
         semantic_weight: Number.isFinite(semanticVal) ? semanticVal : 0.6,
         vector_k: Number.isFinite(vectorTop) ? vectorTop : 50,
@@ -232,6 +237,7 @@
 
       if (system.value.trim()) requestBody.system = system.value.trim();
       if (part.value.trim()) requestBody.part = part.value.trim();
+      if (vehicletype.value.trim()) requestBody.vehicletype = vehicletype.value.trim();
       if (fault_code.value.trim()) requestBody.fault_code = fault_code.value.trim();
 
       const url = API_BASE + "/opensearch/match";
