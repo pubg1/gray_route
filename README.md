@@ -73,7 +73,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8080
 - `GET /health` —— 返回当前可用的数据源（本地 HNSW、OpenSearch、语义索引等）。
 - `GET /match` —— 默认流程：OpenSearch 召回 → 规则判分 → 灰区路由 →（必要时）LLM。
 - `GET /match/hybrid` —— 在本地检索基础上叠加 OpenSearch，并给出推荐策略。
-- `POST /opensearch/match` —— 纯 OpenSearch 版本，支持 `q/system/part/vehicletype/size` 等参数。
+- `POST /opensearch/match` —— 纯 OpenSearch 版本，可选择启用灰区决策与 LLM 精选，支持 `q/system/part/vehicletype/size` 等参数。
 - `GET /opensearch/stats` —— 查看当前索引文档统计。
 
 更多示例见 `docs/API_Documentation.md` 与 `OpenSearch_Integration_README.md`。
@@ -87,6 +87,19 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8080
 - **灰度策略**：可在 `decision.mode` 字段标记 `direct / llm / fallback`，并记录 `confidence` 与 `reason` 以便监控。
 - **模型选择**：支持 OpenAI 协议兼容模型（如 Azure OpenAI、火山方舟、通义千问 OpenAI 版等），亦可接入自建服务。
 - **成本控制**：对热门问题启用缓存，对低置信度设定重试/回退策略，必要时使用小模型先行判断。
+
+### 4.1 OpenSearch 灰区决策参数速查
+
+| 字段 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `use_decision` | bool | `true` | 是否在返回结果中包含灰区判定（`direct/gray/reject`）与理由。|
+| `use_semantic` | bool | `true` | 是否启用向量召回参与融合打分。|
+| `semantic_weight` | float? | `INDEX_CONFIG.default_semantic_weight` | 语义分数在融合中的占比，范围 `[0,1]`。|
+| `vector_k` | int | `50` | 语义召回候选数量。|
+| `use_llm` | bool | `false` | 是否允许在灰区命中时调用 LLM 进行二次甄选。|
+| `llm_topn` | int | `5` | 传入 LLM 的候选数量上限。|
+
+> ⚙️ 当 `use_llm=true` 且最佳候选分数位于 `[gray_low_threshold, pass_threshold)` 区间时，系统会调用 `closed_set_pick` 将若干候选交由 LLM 甄选，并在响应中记录 `decision.mode=llm` 以及 `metadata.llm_*` 字段，便于排查与监控。
 
 ---
 

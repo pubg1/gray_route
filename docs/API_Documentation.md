@@ -75,9 +75,11 @@
 
 #### 决策模式说明
 
-- **`direct`**: 直接推荐，置信度高（≥pass_threshold）
-- **`llm`**: LLM辅助决策，置信度中等（≥gray_low_threshold）
-- **`fallback`**: 兜底模式，置信度较低
+- **`direct`**: 直接推荐，置信度高（≥pass_threshold）。
+- **`gray`**: 落入灰区，建议人工确认或触发 LLM。
+- **`llm`**: LLM 辅助决策，灰区命中后由模型给出最终候选。
+- **`fallback`/`reject`**: 兜底模式，置信度较低或未命中。
+- **`no_match`**: 未检索到任何候选。
 
 #### 匹配原因说明
 
@@ -168,7 +170,12 @@ curl "http://localhost:8000/match?q=发动机无法启动&system=发动机&model
   "decision": {
     "mode": "llm",
     "chosen_id": "P0006",
-    "confidence": 0.75
+    "confidence": 0.75,
+    "llm": {
+      "confidence": 0.72,
+      "why": "更符合异响描述",
+      "chosen_id": "P0006"
+    }
   }
 }
 ```
@@ -185,6 +192,71 @@ curl "http://localhost:8000/match?q=发动机无法启动&system=发动机&model
   }
 }
 ```
+
+### 3. OpenSearch 匹配 (可选灰区决策)
+
+针对已经完成 OpenSearch 导入的环境，使用该端点直接调用远程索引，可启用语义召回、灰区判决和 LLM 精选。
+
+**端点**: `POST /opensearch/match`
+
+#### 请求体参数
+
+| 字段 | 类型 | 必填 | 默认值 | 描述 |
+|------|------|------|--------|------|
+| `q` | string | ✅ | - | 用户查询文本 |
+| `system` | string | ❌ | null | 指定系统过滤 |
+| `part` | string | ❌ | null | 指定部件过滤 |
+| `vehicletype` | string | ❌ | null | 车型过滤 |
+| `fault_code` | string | ❌ | null | 故障码过滤 |
+| `size` | integer | ❌ | 10 | 返回候选数量 |
+| `use_decision` | bool | ❌ | true | 是否返回灰区决策信息 |
+| `use_semantic` | bool | ❌ | true | 是否使用语义向量召回 |
+| `semantic_weight` | number | ❌ | 配置默认值 | BM25 与语义融合的权重 |
+| `vector_k` | integer | ❌ | 50 | 语义召回候选数量 |
+| `use_llm` | bool | ❌ | false | 灰区时是否触发 LLM 精选 |
+| `llm_topn` | integer | ❌ | 5 | 传给 LLM 的候选数量上限 |
+
+#### 响应示例
+
+```json
+{
+  "query": "发动机无法启动",
+  "total": 128,
+  "top": [
+    {
+      "id": "DOC-123",
+      "text": "发动机点火困难...",
+      "system": "发动机",
+      "part": "起动系统",
+      "bm25_score": 0.74,
+      "cosine": 0.68,
+      "final_score": 0.73,
+      "why": ["语义相关", "系统一致"],
+      "sources": ["keyword", "semantic"]
+    }
+  ],
+  "decision": {
+    "mode": "llm",
+    "chosen_id": "DOC-123",
+    "confidence": 0.78,
+    "llm": {
+      "confidence": 0.76,
+      "why": "结合症状描述匹配度最高",
+      "chosen_id": "DOC-123"
+    }
+  },
+  "metadata": {
+    "semantic_used": true,
+    "semantic_weight": 0.6,
+    "vector_k": 50,
+    "keyword_size": 10,
+    "llm_used": true,
+    "llm_candidate_count": 5
+  }
+}
+```
+
+当 `use_decision=false` 时，响应中仅包含 `query/top/metadata` 字段，便于纯检索调试。
 
 ## 错误处理
 
