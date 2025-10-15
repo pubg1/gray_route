@@ -79,6 +79,10 @@
         <label>向量 TopK
           <input type="number" id="vector_k" min="10" max="200" step="10" value="50" />
         </label>
+        <label><input type="checkbox" id="use_llm" /> 灰区调用 LLM 精选</label>
+        <label>LLM 候选数
+          <input type="number" id="llm_topn" min="3" max="10" step="1" value="5" />
+        </label>
       </div>
 
       <div class="meta">
@@ -87,6 +91,7 @@
         <span><span class="dot"></span>决策：<b id="decision">-</b></span>
         <span><span class="dot"></span>置信度：<b id="conf">-</b></span>
         <span><span class="dot"></span>语义检索：<b id="semantic-mode">-</b></span>
+        <span><span class="dot"></span>LLM：<b id="llm-mode">-</b></span>
       </div>
 
       <div class="examples" id="examples"></div>
@@ -141,6 +146,9 @@
     const semanticWeightValue = document.getElementById('semantic_weight_value');
     const vectorK = document.getElementById('vector_k');
     const semanticMode = document.getElementById('semantic-mode');
+    const useLLM = document.getElementById('use_llm');
+    const llmTopn = document.getElementById('llm_topn');
+    const llmMode = document.getElementById('llm-mode');
 
     runBtn.addEventListener('click', runQuery);
     semanticWeight.addEventListener('input', ()=>{
@@ -151,12 +159,15 @@
       useSemantic.checked = true;
       semanticWeight.value = 0.60; semanticWeightValue.textContent = "0.60";
       vectorK.value = 50;
+      useLLM.checked = false;
+      llmTopn.value = 5;
       setDecision({mode:"未查询", confidence:null});
       setLatency(null);
       document.getElementById('results').innerHTML = "";
       document.getElementById('raw').textContent = "";
       document.getElementById('decision-badge').textContent = "未查询";
       semanticMode.textContent = "-";
+      llmMode.textContent = "-";
     });
 
     function setLatency(ms){
@@ -170,8 +181,9 @@
       const badge = document.getElementById('decision-badge');
       const badgeMap = {
         "direct": "直接命中",
-        "gray": "灰区匹配", 
+        "gray": "灰区匹配",
         "fallback": "兜底",
+        "llm": "LLM 精选",
         "opensearch": "OpenSearch",
         "no_match": "无匹配",
         "查询中": "查询中",
@@ -213,7 +225,9 @@
         use_decision: true,
         use_semantic: useSemantic.checked,
         semantic_weight: Number.isFinite(semanticVal) ? semanticVal : 0.6,
-        vector_k: Number.isFinite(vectorTop) ? vectorTop : 50
+        vector_k: Number.isFinite(vectorTop) ? vectorTop : 50,
+        use_llm: useLLM.checked,
+        llm_topn: parseInt(llmTopn.value, 10) || 5
       };
 
       if (system.value.trim()) requestBody.system = system.value.trim();
@@ -224,6 +238,7 @@
       const t0 = performance.now();
       setDecision({mode:"查询中", confidence:null});
       semanticMode.textContent = useSemantic.checked ? "开启" : "关闭";
+      llmMode.textContent = useLLM.checked ? "请求中" : "关闭";
       try{
         const resp = await fetch(url, {
           method: 'POST',
@@ -260,6 +275,14 @@
         } else {
           semanticMode.textContent = "关闭";
         }
+        if (meta.llm_used) {
+          const resp = meta.llm_response || {};
+          const why = resp.why ? ` / ${resp.why}` : '';
+          const conf = typeof resp.confidence === 'number' ? ` / 置信 ${Number(resp.confidence).toFixed(2)}` : '';
+          llmMode.textContent = `已调用${why}${conf}`;
+        } else {
+          llmMode.textContent = useLLM.checked ? "未触发" : "关闭";
+        }
         document.getElementById('raw').textContent = JSON.stringify(data, null, 2);
 
         const grid = document.getElementById('results');
@@ -292,6 +315,7 @@
         setDecision({mode:"错误", confidence:null});
         document.getElementById('raw').textContent = String(err);
         semanticMode.textContent = "错误";
+        llmMode.textContent = "错误";
       }
     }
   </script>
