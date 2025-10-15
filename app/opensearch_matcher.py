@@ -9,7 +9,7 @@ import os
 import sys
 import math
 import logging
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Callable, Awaitable, Any
 from opensearchpy import OpenSearch
 
 # 添加项目根目录到路径
@@ -360,6 +360,83 @@ class OpenSearchMatcher:
                 "top": [],
                 "error": str(e)
             }
+    def _generate_base_decision(
+        self,
+        search_result: Dict,
+        pass_threshold: float,
+        gray_low_threshold: float
+    ) -> Tuple[Dict, Dict[str, Any]]:
+        """根据搜索结果生成基础决策，并返回上下文信息"""
+
+        top_results: List[Dict] = search_result.get("top", []) or []
+        metadata = search_result.get("metadata", {}) or {}
+
+        context: Dict[str, Any] = {
+            "top": top_results,
+            "metadata": metadata,
+            "pass_threshold": pass_threshold,
+            "gray_low_threshold": gray_low_threshold,
+            "best_match": top_results[0] if top_results else None,
+            "best_score": float(top_results[0].get("final_score", 0.0)) if top_results else 0.0,
+            "semantic_used": bool(metadata.get("semantic_used", False))
+        }
+
+        if not top_results:
+            decision = {
+                "mode": "no_match",
+                "chosen_id": None,
+                "confidence": 0.0,
+                "reason": "无匹配结果"
+            }
+            return decision, context
+
+        best_match: Dict = context["best_match"]
+        best_score: float = context["best_score"]
+        semantic_used: bool = context["semantic_used"]
+
+        if best_score >= pass_threshold:
+            reason = f"高置信度匹配 (score: {best_score:.3f})"
+            if semantic_used:
+                reason += "，融合语义检索"
+            decision = {
+                "mode": "direct",
+                "chosen_id": best_match["id"],
+                "confidence": best_score,
+                "reason": reason
+            }
+            return decision, context
+
+        if best_score >= gray_low_threshold:
+            decision = {
+                "mode": "gray",
+                "chosen_id": best_match["id"],
+                "confidence": best_score,
+                "reason": f"灰区匹配，建议人工确认 (score: {best_score:.3f})",
+                "alternatives": [
+                    {
+                        "id": result.get("id"),
+                        "text": (result.get("text", "") or "")[:100] + "...",
+                        "score": result.get("final_score")
+                    }
+                    for result in top_results[1:4]
+                ]
+            }
+            if semantic_used:
+                decision["reason"] += "，含语义召回"
+            return decision, context
+
+        decision = {
+            "mode": "reject",
+            "chosen_id": None,
+            "confidence": best_score,
+            "reason": f"置信度过低 (score: {best_score:.3f})",
+            "suggestions": [
+                (result.get("text", "") or "")[:50] + "..."
+                for result in top_results[:3]
+            ]
+        }
+        return decision, context
+
     def match_with_decision(self,
                            query: str,
                            system: Optional[str] = None,
@@ -386,59 +463,130 @@ class OpenSearchMatcher:
             vector_k=vector_k
         )
 
-        if not search_result["top"]:
-            return {
-                **search_result,
-                "decision": {
-                    "mode": "no_match",
-                    "chosen_id": None,
-                    "confidence": 0.0,
-                    "reason": "无匹配结果"
+        decision, _ = self._generate_base_decision(
+            search_result,
+            pass_threshold=pass_threshold,
+            gray_low_threshold=gray_low_threshold
+        )
+
+        return {
+            **search_result,
+            "decision": decision
+        }
+
+    async def match_with_decision_async(
+        self,
+        query: str,
+        system: Optional[str] = None,
+        part: Optional[str] = None,
+        vehicletype: Optional[str] = None,
+        fault_code: Optional[str] = None,
+        pass_threshold: float = 0.84,
+        gray_low_threshold: float = 0.65,
+        size: int = 10,
+        use_semantic: bool = True,
+        semantic_weight: Optional[float] = None,
+        vector_k: int = 50,
+        use_llm: bool = False,
+        llm_picker: Optional[Callable[[str, List[Dict[str, str]]], Awaitable[Dict[str, Any]]]] = None,
+        llm_topn: int = 5
+    ) -> Dict:
+        """支持异步 LLM 精选的匹配流程"""
+
+        search_result = self.search_phenomena(
+            query=query,
+            system=system,
+            part=part,
+            vehicletype=vehicletype,
+            fault_code=fault_code,
+            size=size,
+            use_semantic=use_semantic,
+            semantic_weight=semantic_weight,
+            vector_k=vector_k
+        )
+
+        decision, context = self._generate_base_decision(
+            search_result,
+            pass_threshold=pass_threshold,
+            gray_low_threshold=gray_low_threshold
+        )
+
+        metadata = search_result.setdefault("metadata", {})
+        metadata.setdefault("llm_used", False)
+
+        best_match = context.get("best_match")
+        best_score = float(context.get("best_score", 0.0) or 0.0)
+
+        should_try_llm = (
+            use_llm
+            and llm_picker is not None
+            and best_match is not None
+            and gray_low_threshold <= best_score < pass_threshold
+        )
+
+        if should_try_llm:
+            try:
+                llm_topn = max(1, int(llm_topn))
+            except (TypeError, ValueError):
+                llm_topn = 5
+
+            candidates = []
+            for item in context.get("top", [])[:llm_topn]:
+                candidates.append({
+                    "id": str(item.get("id", "")),
+                    "text": (item.get("text", "") or "")[:300]
+                })
+
+            metadata["llm_used"] = True
+            metadata["llm_candidate_count"] = len(candidates)
+
+            try:
+                llm_response = await llm_picker(query, candidates)
+            except Exception as llm_err:  # pragma: no cover - 网络/配置错误较难复现
+                logger.error(f"LLM 精选失败: {llm_err}")
+                llm_response = {"chosen_id": "UNKNOWN", "confidence": 0.0, "why": "llm_error"}
+
+            metadata["llm_response"] = llm_response
+
+            chosen_id = llm_response.get("chosen_id")
+            llm_conf = float(llm_response.get("confidence") or 0.0)
+
+            if chosen_id and chosen_id != "UNKNOWN":
+                chosen_item = next(
+                    (item for item in context.get("top", []) if str(item.get("id")) == str(chosen_id)),
+                    best_match
+                )
+                base_score = float(chosen_item.get("final_score") or 0.0)
+                confidence = max(base_score, llm_conf, best_score)
+                decision = {
+                    "mode": "llm",
+                    "chosen_id": chosen_item.get("id"),
+                    "confidence": confidence,
+                    "reason": llm_response.get("why") or "LLM 精选候选",
+                    "llm": {
+                        "confidence": llm_conf,
+                        "why": llm_response.get("why"),
+                        "chosen_id": chosen_id
+                    },
+                    "alternatives": [
+                        {
+                            "id": item.get("id"),
+                            "text": (item.get("text", "") or "")[:100] + "...",
+                            "score": item.get("final_score")
+                        }
+                        for item in context.get("top", [])
+                        if item.get("id") != chosen_item.get("id")
+                    ][:3]
                 }
-            }
-
-        best_match = search_result["top"][0]
-        best_score = best_match["final_score"]
-        semantic_used = search_result.get("metadata", {}).get("semantic_used", False)
-
-        if best_score >= pass_threshold:
-            reason = f"高置信度匹配 (score: {best_score:.3f})"
-            if semantic_used:
-                reason += "，融合语义检索"
-            decision = {
-                "mode": "direct",
-                "chosen_id": best_match["id"],
-                "confidence": best_score,
-                "reason": reason
-            }
-        elif best_score >= gray_low_threshold:
-            decision = {
-                "mode": "gray",
-                "chosen_id": best_match["id"],
-                "confidence": best_score,
-                "reason": f"灰区匹配，建议人工确认 (score: {best_score:.3f})",
-                "alternatives": [
-                    {
-                        "id": result["id"],
-                        "text": result["text"][:100] + "...",
-                        "score": result["final_score"]
+            else:
+                decision = {
+                    **decision,
+                    "llm": {
+                        "confidence": llm_conf,
+                        "why": llm_response.get("why"),
+                        "chosen_id": chosen_id or "UNKNOWN"
                     }
-                    for result in search_result["top"][1:4]
-                ]
-            }
-            if semantic_used:
-                decision["reason"] += "，含语义召回"
-        else:
-            decision = {
-                "mode": "reject",
-                "chosen_id": None,
-                "confidence": best_score,
-                "reason": f"置信度过低 (score: {best_score:.3f})",
-                "suggestions": [
-                    result["text"][:50] + "..."
-                    for result in search_result["top"][:3]
-                ]
-            }
+                }
 
         return {
             **search_result,
