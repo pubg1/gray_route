@@ -130,6 +130,8 @@ class OpenSearchRequest(BaseModel):
     use_semantic: bool = True
     semantic_weight: Optional[float] = None
     vector_k: int = 50
+    use_llm: bool = False
+    llm_topn: int = 5
 
 @app.post("/opensearch/match")
 async def opensearch_match(request: OpenSearchRequest):
@@ -142,8 +144,8 @@ async def opensearch_match(request: OpenSearchRequest):
     
     try:
         if request.use_decision:
-            # 使用灰区路由决策
-            result = opensearch_matcher.match_with_decision(
+            # 使用灰区路由决策，必要时调用 LLM 精选
+            result = await opensearch_matcher.match_with_decision_async(
                 query=request.q,
                 system=request.system,
                 part=request.part,
@@ -154,7 +156,10 @@ async def opensearch_match(request: OpenSearchRequest):
                 size=request.size,
                 use_semantic=request.use_semantic,
                 semantic_weight=request.semantic_weight,
-                vector_k=request.vector_k
+                vector_k=request.vector_k,
+                use_llm=request.use_llm,
+                llm_picker=closed_set_pick if request.use_llm else None,
+                llm_topn=request.llm_topn
             )
         else:
             # 仅返回搜索结果
@@ -216,7 +221,7 @@ async def hybrid_match(
     opensearch_result = None
     if use_opensearch and OPENSEARCH_AVAILABLE:
         try:
-            opensearch_result = opensearch_matcher.match_with_decision(
+            opensearch_result = await opensearch_matcher.match_with_decision_async(
                 query=q,
                 system=system,
                 part=part,
