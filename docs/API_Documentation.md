@@ -15,14 +15,22 @@
 
 ### 1. 健康检查
 
-检查服务是否正常运行。
+检查服务是否正常运行，并返回当前可用的数据源信息。
 
 **端点**: `GET /health`
 
 **响应示例**:
 ```json
 {
-  "status": "ok"
+  "status": "ok",
+  "opensearch_available": true,
+  "semantic_available": true,
+  "data_sources": [
+    "local_hnsw",
+    "local_tfidf",
+    "opensearch",
+    "opensearch_semantic"
+  ]
 }
 ```
 
@@ -257,6 +265,58 @@ curl "http://localhost:8000/match?q=发动机无法启动&system=发动机&model
 ```
 
 当 `use_decision=false` 时，响应中仅包含 `query/top/metadata` 字段，便于纯检索调试。
+
+### 4. OpenSearch 索引统计
+
+获取当前 OpenSearch 索引的状态与统计信息。
+
+**端点**: `GET /opensearch/stats`
+
+**响应示例**（示例字段，实际值依索引而定）:
+```json
+{
+  "index": "fault-phenomena",
+  "doc_count": 12543,
+  "vector_count": 12543,
+  "semantic_available": true,
+  "updated_at": "2024-05-20T08:12:53Z"
+}
+```
+
+### 5. 混合匹配 (本地 + OpenSearch)
+
+同时调用本地索引与 OpenSearch，返回两路结果的对比建议。
+
+**端点**: `GET /match/hybrid`
+
+#### 请求参数
+
+| 参数名 | 类型 | 必填 | 默认值 | 描述 |
+|--------|------|------|--------|------|
+| `q` | string | ✅ | - | 用户查询的故障描述 |
+| `system` | string | ❌ | null | 指定系统类型 |
+| `part` | string | ❌ | null | 指定部件名称 |
+| `vehicletype` | string | ❌ | null | 车型过滤（仅对 OpenSearch 生效） |
+| `use_opensearch` | bool | ❌ | true | 是否调用 OpenSearch 进行对比 |
+| `topn_return` | integer | ❌ | 3 | 返回本地结果的数量 |
+
+#### 响应结构
+
+```json
+{
+  "query": "处理后的查询文本",
+  "local_result": { ... 与 /match 相同结构 ... },
+  "opensearch_result": { ... 与 /opensearch/match 相同结构 ... },
+  "recommendation": {
+    "use_local": true,
+    "use_opensearch": false,
+    "confidence_comparison": {
+      "local": 0.92,
+      "opensearch": 0.81
+    }
+  }
+}
+```
 
 ## 错误处理
 
