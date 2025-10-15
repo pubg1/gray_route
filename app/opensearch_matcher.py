@@ -288,7 +288,9 @@ class OpenSearchMatcher:
                                 }
                                 merged[doc_id] = item
                             item['semantic_score'] = max(item.get('semantic_score', 0.0), semantic_raw)
-                            item['cosine'] = max(item.get('cosine', 0.0), (semantic_raw + 1.0) / 2.0)
+                            cosine_norm = (semantic_raw + 1.0) / 2.0
+                            cosine_norm = min(1.0, max(0.0, cosine_norm))
+                            item['cosine'] = max(item.get('cosine', 0.0), cosine_norm)
                             sources = set(item.get('sources', []))
                             sources.add('semantic')
                             item['sources'] = list(sources)
