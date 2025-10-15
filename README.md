@@ -121,6 +121,37 @@ bash scripts/index_build_local.sh
 
 ---
 
-## 7. 许可证
+## 7. API 端点（默认开启）
+
+- `GET /health`：返回当前可用的数据源（本地 HNSW/TF-IDF、OpenSearch、本地语义索引等）。
+- `GET /match`：默认本地检索 + 精排 + 灰区路由闭集判别。
+- `GET /match/hybrid`：在本地结果基础上，叠加 OpenSearch（如启用），并给出推荐策略。
+- `POST /opensearch/match`：对接 OpenSearch 索引的召回/灰区路由（无本地索引也可用）。
+- `GET /opensearch/stats`：查看当前 OpenSearch 索引文档统计（如启用）。
+
+示例命令见 `docs/API_Documentation.md` 与 `OpenSearch_Integration_README.md`。
+
+---
+
+## 8. OpenSearch 集成（可选）
+
+- 若需从远端 OpenSearch 检索，可使用 `scripts/deploy_complete_system.py`、`scripts/run_opensearch_import.py` 等脚本。
+- 详细步骤、字段映射、混合匹配说明请参考 `OpenSearch_Integration_README.md`。
+- `.env` 中的 `PASS_THRESHOLD`、`GRAY_LOW_THRESHOLD` 与 OpenSearch 召回保持一致，方便闭环调优。
+
+---
+
+## 9. 服务管理脚本
+
+脚本目录位于 `scripts/`，常用操作如下：
+
+- `bash scripts/run_local.sh`：后台启动服务，自动写入日志/ PID 文件。
+- `bash scripts/status_local.sh`：查看运行状态、端口、健康检查。
+- `bash scripts/restart_local.sh`：优雅重启；`bash scripts/stop_local.sh`：停止服务。
+- 更多说明可见 `scripts/README.md`。
+
+---
+
+## 10. 许可证
 
 MIT
