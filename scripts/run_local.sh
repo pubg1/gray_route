@@ -35,6 +35,13 @@ echo "   地址: http://$HOST:$PORT"
 echo "   日志: $LOG_FILE"
 echo "   错误日志: $ERROR_LOG_FILE"
 echo "   PID文件: $PID_FILE"
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    CURRENT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    echo "   当前提交: $CURRENT_COMMIT"
+    if ! git diff --quiet --ignore-submodules HEAD 2>/dev/null; then
+        echo "   ⚠️ 检测到工作区存在未提交的更改，将以本地修改版本启动服务。"
+    fi
+fi
 
 # 后台启动服务
 nohup uvicorn app.main:app \
