@@ -18,6 +18,11 @@
     .form input::placeholder { color:#98a3bf80; }
     .form button { background: linear-gradient(180deg, #2a63ff, #2052d6); border:0; font-weight:600; cursor:pointer; }
     .form button.secondary { background:#0f1527; border:1px solid #2a3a63; }
+    .options { display:flex; flex-wrap:wrap; gap:16px; padding:12px 16px; border-bottom:1px dashed #2a3a63; background:rgba(11,17,32,0.35); }
+    .options label { display:flex; align-items:center; gap:8px; color:#c5d4ff; font-size:13px; }
+    .options input[type="checkbox"] { width:16px; height:16px; accent-color:#4f8cff; }
+    .options input[type="range"] { width:160px; }
+    .options input[type="number"] { width:90px; height:32px; border-radius:8px; border:1px solid #33446f; background:#0f1527; color:var(--text); padding:0 8px; }
     .meta { display:flex; align-items:center; gap:12px; padding:10px 16px; color: var(--muted); font-size:12px; }
     .meta .dot { width:6px; height:6px; border-radius:50%; display:inline-block; margin-right:6px; background:#4e5d86; }
     .examples { padding: 12px 16px; display:flex; flex-wrap: wrap; gap:8px; border-top:1px dashed #2a3a63; }
@@ -34,6 +39,7 @@
     .why { display:flex; flex-wrap: wrap; gap:6px; margin-top:6px; }
     .tag { font-size:12px; padding:2px 8px; border-radius:999px; background:#152247; color:#b7cdfb; border:1px solid #2a3a63; }
     .text { margin-top:8px; font-size:15px; }
+    .source-line { margin-top:6px; font-size:12px; color:#8ba2d8; }
     mark { background: #fde68a99; color: #fff; padding: 0 .2em; border-radius: 4px; }
     details { padding: 0 16px 16px; }
     pre { white-space: pre-wrap; word-break: break-word; background: #0b1020; padding: 12px; border-radius: 10px; border:1px solid #2a3a63; }
@@ -64,11 +70,23 @@
         </div>
       </form>
 
+      <div class="options">
+        <label><input type="checkbox" id="use_semantic" checked /> 启用语义向量检索</label>
+        <label>语义权重
+          <input type="range" id="semantic_weight" min="0.30" max="0.90" step="0.05" value="0.60" />
+          <span id="semantic_weight_value">0.60</span>
+        </label>
+        <label>向量 TopK
+          <input type="number" id="vector_k" min="10" max="200" step="10" value="50" />
+        </label>
+      </div>
+
       <div class="meta">
         <span><span class="dot"></span>服务：<b id="endpoint"></b></span>
         <span><span class="dot"></span>耗时：<b id="latency">-</b> ms</span>
         <span><span class="dot"></span>决策：<b id="decision">-</b></span>
         <span><span class="dot"></span>置信度：<b id="conf">-</b></span>
+        <span><span class="dot"></span>语义检索：<b id="semantic-mode">-</b></span>
       </div>
 
       <div class="examples" id="examples"></div>
@@ -87,6 +105,12 @@
   <script>
     const API_BASE = location.origin; // 与后端同源；你也可以改成 'http://127.0.0.1:8080'
     document.getElementById('endpoint').textContent = API_BASE;
+
+    const SOURCE_LABEL = { keyword: "关键词召回", semantic: "语义召回" };
+    const formatSources = (list)=>{
+      if (!Array.isArray(list) || !list.length) return "";
+      return list.map(s=>SOURCE_LABEL[s] || s).join(' + ');
+    };
 
     const EXAMPLES = [
       {q:"发动机无法启动", system:"发动机", part:"启动系统", fault_code:""},
@@ -112,15 +136,27 @@
     const topn = document.getElementById('topn');
     const runBtn = document.getElementById('run');
     const resetBtn = document.getElementById('reset');
+    const useSemantic = document.getElementById('use_semantic');
+    const semanticWeight = document.getElementById('semantic_weight');
+    const semanticWeightValue = document.getElementById('semantic_weight_value');
+    const vectorK = document.getElementById('vector_k');
+    const semanticMode = document.getElementById('semantic-mode');
 
     runBtn.addEventListener('click', runQuery);
+    semanticWeight.addEventListener('input', ()=>{
+      semanticWeightValue.textContent = Number(semanticWeight.value).toFixed(2);
+    });
     resetBtn.addEventListener('click', ()=>{
       q.value = ""; system.value=""; part.value=""; fault_code.value="";
+      useSemantic.checked = true;
+      semanticWeight.value = 0.60; semanticWeightValue.textContent = "0.60";
+      vectorK.value = 50;
       setDecision({mode:"未查询", confidence:null});
       setLatency(null);
       document.getElementById('results').innerHTML = "";
       document.getElementById('raw').textContent = "";
       document.getElementById('decision-badge').textContent = "未查询";
+      semanticMode.textContent = "-";
     });
 
     function setLatency(ms){
@@ -169,12 +205,17 @@
       const qv = q.value.trim();
       if (!qv) { q.focus(); return; }
       
+      const semanticVal = parseFloat(semanticWeight.value);
+      const vectorTop = parseInt(vectorK.value, 10);
       const requestBody = {
         q: qv,
         size: parseInt(topn.value),
-        use_decision: true
+        use_decision: true,
+        use_semantic: useSemantic.checked,
+        semantic_weight: Number.isFinite(semanticVal) ? semanticVal : 0.6,
+        vector_k: Number.isFinite(vectorTop) ? vectorTop : 50
       };
-      
+
       if (system.value.trim()) requestBody.system = system.value.trim();
       if (part.value.trim()) requestBody.part = part.value.trim();
       if (fault_code.value.trim()) requestBody.fault_code = fault_code.value.trim();
@@ -182,10 +223,11 @@
       const url = API_BASE + "/opensearch/match";
       const t0 = performance.now();
       setDecision({mode:"查询中", confidence:null});
+      semanticMode.textContent = useSemantic.checked ? "开启" : "关闭";
       try{
-        const resp = await fetch(url, { 
+        const resp = await fetch(url, {
           method: 'POST',
-          headers: { 
+          headers: {
             "Content-Type": "application/json",
             "Accept": "application/json" 
           },
@@ -210,6 +252,14 @@
           }
           setDecision(decision);
         }
+        const meta = data.metadata || {};
+        if (meta.semantic_used) {
+          const weightText = typeof meta.semantic_weight === 'number' ? meta.semantic_weight.toFixed(2) : semanticWeightValue.textContent;
+          const kText = meta.vector_k ? ` · k=${meta.vector_k}` : '';
+          semanticMode.textContent = `开启 / 权重 ${weightText}${kText}`;
+        } else {
+          semanticMode.textContent = "关闭";
+        }
         document.getElementById('raw').textContent = JSON.stringify(data, null, 2);
 
         const grid = document.getElementById('results');
@@ -228,9 +278,10 @@
               <div class="${scClass}">${(c.final_score ?? 0).toFixed(3)}</div>
             </div>
             <div class="text">${highlight(c.text || '', qv)}</div>
+            ${c.sources && c.sources.length ? `<div class="source-line">来源：${escHTML(formatSources(c.sources))}</div>` : ''}
             <div class="why">${(c.why || []).map(w=>`<span class="tag">${escHTML(w)}</span>`).join('')}</div>
             <div style="margin-top:6px; color:#94a3b8; font-size:12px">
-              rerank=${(c.rerank_score??0).toFixed(3)} ｜ cosine=${(c.cosine??0).toFixed(3)} ｜ bm25=${(c.bm25_score??0).toFixed(3)}
+              融合=${(c.rerank_score??0).toFixed(3)} ｜ 语义=${(c.cosine??0).toFixed(3)} ｜ bm25=${(c.bm25_score??0).toFixed(3)}
             </div>
           `;
           grid.appendChild(card);
@@ -240,6 +291,7 @@
         setLatency(null);
         setDecision({mode:"错误", confidence:null});
         document.getElementById('raw').textContent = String(err);
+        semanticMode.textContent = "错误";
       }
     }
   </script>

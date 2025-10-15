@@ -22,6 +22,11 @@ INDEX_CONFIG = {
     'name': 'automotive_cases',  # 索引名称
     'shards': 1,  # 分片数
     'replicas': 0,  # 副本数
+    # 语义检索相关配置
+    'vector_field': 'text_vector',  # 存储文本向量的字段
+    'embedding_dim': 512,  # 向量维度（需与导入时生成的向量一致）
+    'default_semantic_weight': 0.6,  # 语义得分在最终融合中的默认权重
+    'vector_num_candidates': 200,  # kNN 搜索的候选数量
 }
 
 # 导入配置
