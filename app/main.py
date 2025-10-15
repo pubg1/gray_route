@@ -23,6 +23,10 @@ except ImportError:
     OPENSEARCH_AVAILABLE = False
     opensearch_matcher = None
 
+OPENSEARCH_SEMANTIC_AVAILABLE = bool(
+    OPENSEARCH_AVAILABLE and getattr(opensearch_matcher, "semantic_available", False)
+)
+
 logger = logging.getLogger(__name__)
 
 app = FastAPI(default_response_class=ORJSONResponse)
@@ -39,10 +43,16 @@ def normalize_bm25(score: float) -> float:
     return float(min(1.0, score / 20.0))
 @app.get("/health")
 def health():
+    sources = ["local_hnsw", "local_tfidf"]
+    if OPENSEARCH_AVAILABLE:
+        sources.append("opensearch")
+        if OPENSEARCH_SEMANTIC_AVAILABLE:
+            sources.append("opensearch_semantic")
     return {
         "status": "ok",
         "opensearch_available": OPENSEARCH_AVAILABLE,
-        "data_sources": ["local_hnsw", "local_tfidf"] + (["opensearch"] if OPENSEARCH_AVAILABLE else [])
+        "semantic_available": OPENSEARCH_SEMANTIC_AVAILABLE,
+        "data_sources": sources
     }
 @app.get("/match", response_model=MatchResponse)
 async def match(q: str = Query(..., description="用户查询"), system: Optional[str] = None, part: Optional[str] = None,
@@ -117,6 +127,9 @@ class OpenSearchRequest(BaseModel):
     fault_code: Optional[str] = None
     size: int = 10
     use_decision: bool = True
+    use_semantic: bool = True
+    semantic_weight: Optional[float] = None
+    vector_k: int = 50
 
 @app.post("/opensearch/match")
 async def opensearch_match(request: OpenSearchRequest):
@@ -134,10 +147,14 @@ async def opensearch_match(request: OpenSearchRequest):
                 query=request.q,
                 system=request.system,
                 part=request.part,
+                vehicletype=request.vehicletype,
                 fault_code=request.fault_code,
                 pass_threshold=settings.pass_threshold,
                 gray_low_threshold=settings.gray_low_threshold,
-                size=request.size
+                size=request.size,
+                use_semantic=request.use_semantic,
+                semantic_weight=request.semantic_weight,
+                vector_k=request.vector_k
             )
         else:
             # 仅返回搜索结果
@@ -147,7 +164,10 @@ async def opensearch_match(request: OpenSearchRequest):
                 part=request.part,
                 vehicletype=request.vehicletype,
                 fault_code=request.fault_code,
-                size=request.size
+                size=request.size,
+                use_semantic=request.use_semantic,
+                semantic_weight=request.semantic_weight,
+                vector_k=request.vector_k
             )
         
         return result
@@ -200,6 +220,7 @@ async def hybrid_match(
                 query=q,
                 system=system,
                 part=part,
+                vehicletype=vehicletype,
                 pass_threshold=settings.pass_threshold,
                 gray_low_threshold=settings.gray_low_threshold
             )
