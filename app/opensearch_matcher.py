@@ -5,17 +5,19 @@
 按照 README.md 设计，从 OpenSearch 中查询匹配故障现象
 """
 
+import math
 import os
 import sys
-import math
 import logging
-from typing import List, Dict, Optional, Tuple, Callable, Awaitable, Any
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+
 from opensearchpy import OpenSearch
 
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from scripts.opensearch_config import OPENSEARCH_CONFIG, INDEX_CONFIG
+from .utils.calibration import clamp, compute_stats, logistic_from_stats
 
 try:
     from app.embedding import get_embedder  # type: ignore
@@ -214,7 +216,9 @@ class OpenSearchMatcher:
                     "rate": source.get('rate'),
                     "highlight": hit.get('highlight', {}),
                     "sources": ["keyword"],
-                    "bm25_score": min(1.0, bm25_raw / 10.0),
+                    "bm25_raw": bm25_raw,
+                    "semantic_raw": 0.0,
+                    "bm25_score": 0.0,
                     "semantic_score": 0.0,
                     "cosine": 0.0,
                     "rerank_score": 0.0
@@ -281,13 +285,15 @@ class OpenSearchMatcher:
                                     "rate": source.get('rate'),
                                     "highlight": hit.get('highlight', {}),
                                     "sources": [],
+                                    "bm25_raw": 0.0,
+                                    "semantic_raw": 0.0,
                                     "bm25_score": 0.0,
                                     "semantic_score": 0.0,
                                     "cosine": 0.0,
                                     "rerank_score": 0.0
                                 }
                                 merged[doc_id] = item
-                            item['semantic_score'] = max(item.get('semantic_score', 0.0), semantic_raw)
+                            item['semantic_raw'] = max(item.get('semantic_raw', 0.0), semantic_raw)
                             cosine_norm = (semantic_raw + 1.0) / 2.0
                             cosine_norm = min(1.0, max(0.0, cosine_norm))
                             item['cosine'] = max(item.get('cosine', 0.0), cosine_norm)
@@ -300,14 +306,38 @@ class OpenSearchMatcher:
                         logger.error(f"语义检索失败: {knn_err}")
                         effective_semantic = False
 
+            bm25_stats = compute_stats(
+                item.get('bm25_raw')
+                for item in merged.values()
+                if item.get('bm25_raw') is not None
+            )
+            semantic_stats = compute_stats(
+                item.get('semantic_raw')
+                for item in merged.values()
+                if item.get('semantic_raw') is not None
+            )
+
             results: List[Dict] = []
             for item in merged.values():
-                bm25_norm = float(item.get('bm25_score') or 0.0)
-                semantic_norm = float(item.get('cosine') or 0.0) if effective_semantic else 0.0
+                bm25_raw = float(item.get('bm25_raw') or 0.0)
+                semantic_raw = float(item.get('semantic_raw') or 0.0)
+
+                bm25_norm = logistic_from_stats(
+                    bm25_raw,
+                    bm25_stats,
+                    fallback=clamp(bm25_raw / 10.0),
+                )
+                semantic_norm = 0.0
+                if effective_semantic:
+                    semantic_norm = logistic_from_stats(
+                        semantic_raw,
+                        semantic_stats,
+                        fallback=clamp((semantic_raw + 1.0) / 2.0),
+                    )
                 popularity = item.get('popularity', 0) or 0
-                popularity_norm = min(1.0, math.log1p(popularity) / 5.0)
+                popularity_norm = clamp(math.log1p(max(0.0, float(popularity))) / 5.0)
                 search_num = item.get('searchNum', 0) or 0
-                search_norm = min(1.0, search_num / 50.0)
+                search_norm = clamp(float(search_num) / 50.0)
 
                 fusion_base = semantic_weight * semantic_norm + (1.0 - semantic_weight) * bm25_norm
                 final_score = min(1.0, fusion_base + 0.05 * popularity_norm + 0.05 * search_norm)
@@ -331,6 +361,7 @@ class OpenSearchMatcher:
                 item['final_score'] = final_score
                 item['rerank_score'] = fusion_base
                 item['bm25_score'] = bm25_norm
+                item['semantic_score'] = semantic_norm
                 item['cosine'] = semantic_norm
                 item['why'] = why or ["文本匹配"]
                 item['sources'] = sorted(set(item.get('sources', [])))
@@ -343,7 +374,15 @@ class OpenSearchMatcher:
                 "semantic_used": effective_semantic,
                 "semantic_weight": semantic_weight if effective_semantic else 0.0,
                 "vector_k": vector_k if effective_semantic else 0,
-                "keyword_size": size
+                "keyword_size": size,
+                "bm25_stats": {
+                    "mean": bm25_stats[0],
+                    "std": bm25_stats[1],
+                } if bm25_stats else None,
+                "semantic_stats": {
+                    "mean": semantic_stats[0],
+                    "std": semantic_stats[1],
+                } if semantic_stats else None,
             }
 
             return {

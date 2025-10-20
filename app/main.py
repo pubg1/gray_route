@@ -1,19 +1,23 @@
 
-from fastapi import FastAPI, Query
-from fastapi.responses import ORJSONResponse
-from typing import Optional, List
+import asyncio
+import logging
+import os
+from typing import List, Optional
+
 import numpy as np
+from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import ORJSONResponse
+from fastapi.staticfiles import StaticFiles
+
 from .config import get_settings
-from .reranker import get_reranker
-from .models import Candidate, MatchResponse
-from .utils.normalize import normalize_query
 from .llm_router import closed_set_pick
+from .models import Candidate, MatchResponse
+from .reranker import get_reranker
 from .searchers.hnswlib_index import HNSWSearcher
 from .searchers.keyword_tfidf import KeywordSearcher
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
-import os
-import logging
+from .utils.calibration import clamp, compute_stats, logistic_from_stats
+from .utils.normalize import normalize_query
 
 # 尝试导入 OpenSearch 匹配器
 try:
@@ -39,8 +43,6 @@ app.add_middleware(
 settings = get_settings()
 _hnsw = HNSWSearcher(settings.data_file, settings.hnsw_index_path)
 _kw = KeywordSearcher(settings.data_file, settings.tfidf_cache_path)
-def normalize_bm25(score: float) -> float:
-    return float(min(1.0, score / 20.0))
 @app.get("/health")
 def health():
     sources = ["local_hnsw", "local_tfidf"]
@@ -60,8 +62,9 @@ async def match(q: str = Query(..., description="用户查询"), system: Optiona
                 topn_return: int = 3):
     query = normalize_query(q)
     reranker = get_reranker()
-    knn_hits = _hnsw.knn(query, topk=topk_vec)
-    bm25_hits = _kw.search(query, topk=topk_kw)
+    knn_task = asyncio.to_thread(_hnsw.knn, query, topk=topk_vec)
+    bm25_task = asyncio.to_thread(_kw.search, query, topk=topk_kw)
+    knn_hits, bm25_hits = await asyncio.gather(knn_task, bm25_task)
     seen = set(); pool: List[Candidate] = []
     for src in knn_hits + bm25_hits:
         cid = src.get("id", "")
@@ -80,21 +83,55 @@ async def match(q: str = Query(..., description="用户查询"), system: Optiona
     rerank_scores = reranker.score(query, texts, batch_size=16) if texts else []
     for p, s in zip(pool, rerank_scores):
         p.rerank_score = float(s)
+
+    rerank_stats = compute_stats(rerank_scores)
+    bm25_raws = [p.bm25_score for p in pool if p.bm25_score is not None]
+    bm25_stats = compute_stats(bm25_raws)
+    cosine_raws = [p.cosine for p in pool if p.cosine is not None]
+    cosine_stats = compute_stats(cosine_raws)
     def kg_prior(p: Candidate) -> float:
         prior = 0.0
         if system and p.system and system == p.system: prior += 1.0
         if part and p.part and part == p.part: prior += 0.5
         return min(1.0, prior)
+    weights = settings.fusion_weights.as_dict()
     for p in pool:
-        cos = p.cosine or 0.0; bm = normalize_bm25(p.bm25_score or 0.0); kg = kg_prior(p)
-        pop = float(p.popularity or 0.0); pop = np.log1p(pop) / 5.0; rer = p.rerank_score or 0.0
-        p.final_score = 0.55*rer + 0.20*cos + 0.10*bm + 0.10*kg + 0.05*pop
-        why = []; 
-        if cos: why.append("语义近")
-        if bm>0.1: why.append("关键词命中")
-        if kg>=1.0: why.append("系统一致")
-        elif kg>0.1: why.append("部件相近")
+        cos_raw = p.cosine or 0.0
+        bm_raw = p.bm25_score or 0.0
+        rer_raw = p.rerank_score or 0.0
+
+        rer = logistic_from_stats(rer_raw, rerank_stats, fallback=rer_raw)
+        bm = logistic_from_stats(bm_raw, bm25_stats, fallback=clamp(bm_raw / 20.0))
+        cos = logistic_from_stats(cos_raw, cosine_stats, fallback=clamp(cos_raw))
+        kg = kg_prior(p)
+        raw_pop = max(0.0, float(p.popularity or 0.0))
+        pop = clamp(np.log1p(raw_pop) / 5.0)
+
+        p.final_score = (
+            weights["rerank"] * rer
+            + weights["semantic"] * cos
+            + weights["keyword"] * bm
+            + weights["knowledge"] * kg
+            + weights["popularity"] * pop
+        )
+
+        why = []
+        if rer >= 0.6:
+            why.append("精排高分")
+        if cos >= 0.4:
+            why.append("语义近")
+        if bm >= 0.2:
+            why.append("关键词命中")
+        if kg >= 1.0:
+            why.append("系统一致")
+        elif kg > 0.1:
+            why.append("部件相近")
+        if pop >= 0.5:
+            why.append("热门案例")
         p.why = why
+        p.rerank_score = rer
+        p.bm25_score = bm
+        p.cosine = cos
     pool.sort(key=lambda x: x.final_score or 0.0, reverse=True)
     top10 = pool[:10]
     decision = {"mode": "fallback", "chosen_id": None, "confidence": 0.0}
