@@ -22,7 +22,8 @@ class Reranker:
             inputs = self.tokenizer(pairs, padding=True, truncation=True, return_tensors='pt', max_length=512)
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
             logits = self.model(**inputs).logits.squeeze(-1)
-            scores.extend(logits.detach().cpu().tolist())
+            probs = torch.sigmoid(logits)
+            scores.extend(probs.detach().cpu().tolist())
         return scores
 _reranker = None
 def get_reranker() -> Reranker:
