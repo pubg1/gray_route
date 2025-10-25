@@ -83,6 +83,43 @@ logger = logging.getLogger(__name__)
 
 
 class OpenSearchImporter:
+    @staticmethod
+    def _normalize_host(raw_host: Any) -> str:
+        """Ensure the OpenSearch host value is a non-empty hostname string."""
+
+        if isinstance(raw_host, bool):
+            raise ValueError(
+                "OpenSearch host 配置不能是布尔值，请检查 OPENSEARCH_HOST 或配置文件"
+            )
+
+        if raw_host is None:
+            return "localhost"
+
+        host_str = str(raw_host).strip()
+        if not host_str:
+            raise ValueError(
+                "OpenSearch host 配置为空，请在环境变量或 opensearch_config.py 中设置有效地址"
+            )
+
+        return host_str
+
+    @staticmethod
+    def _normalize_port(raw_port: Any) -> int:
+        """Validate the OpenSearch port value and convert it to ``int``."""
+
+        if isinstance(raw_port, bool) or raw_port is None:
+            raise ValueError("OpenSearch port 配置无效，请提供正确的端口号")
+
+        try:
+            port_int = int(raw_port)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("OpenSearch port 必须是整数") from exc
+
+        if port_int <= 0:
+            raise ValueError("OpenSearch port 必须是正整数")
+
+        return port_int
+
     def __init__(
         self,
         host: str = "localhost",
@@ -101,6 +138,13 @@ class OpenSearchImporter:
         model_cache_dir: Optional[str] = None,
     ) -> None:
         """初始化 OpenSearch 连接并准备向量写入。"""
+
+        try:
+            host = self._normalize_host(host)
+            port = self._normalize_port(port)
+        except ValueError as exc:
+            logger.error("无效的 OpenSearch 连接配置: %s", exc)
+            raise
 
         if host.startswith("http://") or host.startswith("https://"):
             host = host.replace("https://", "").replace("http://", "")
@@ -655,20 +699,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
 
-    importer = OpenSearchImporter(
-        host=args.host,
-        port=args.port,
-        username=args.username,
-        password=args.password,
-        use_ssl=args.ssl,
-        verify_certs=args.verify_certs,
-        timeout=args.timeout,
-        enable_vector=args.enable_vector,
-        vector_field=args.vector_field,
-        vector_dimension=args.vector_dim,
-        embedding_model=args.embedding_model,
-        model_cache_dir=args.model_cache,
-    )
+    try:
+        importer = OpenSearchImporter(
+            host=args.host,
+            port=args.port,
+            username=args.username,
+            password=args.password,
+            use_ssl=args.ssl,
+            verify_certs=args.verify_certs,
+            timeout=args.timeout,
+            enable_vector=args.enable_vector,
+            vector_field=args.vector_field,
+            vector_dimension=args.vector_dim,
+            embedding_model=args.embedding_model,
+            model_cache_dir=args.model_cache,
+        )
+    except ValueError:
+        return 1
 
     success = importer.import_data(args.file, args.index, batch_size=args.batch_size)
 
