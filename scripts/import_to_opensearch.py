@@ -1027,9 +1027,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--clone-mapping-from",
         default=None,
-        help="从指定索引克隆映射，保留所有原字段 (留空表示不克隆)",
-        default="automotive_cases",
-        help="从指定索引克隆映射，保留所有原字段",
+        help=(
+            "从指定索引克隆映射，保留所有原字段 (默认不克隆；若需使用，请指定索引名称)"
+        ),
     )
     parser.add_argument(
         "--preserve-source-fields",
