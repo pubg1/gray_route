@@ -233,6 +233,9 @@ class OpenSearchImporter:
         try:
             use_ssl_flag = self._coerce_bool("use_ssl", use_ssl)
             verify_certs_flag = self._coerce_bool("verify_certs", verify_certs)
+            ssl_assert_hostname_flag = self._coerce_bool(
+                "ssl_assert_hostname", ssl_assert_hostname, default=True
+            )
             ssl_show_warn_flag = self._coerce_bool(
                 "ssl_show_warn", ssl_show_warn, default=True
             )
@@ -267,6 +270,7 @@ class OpenSearchImporter:
             "http_compress": True,
             "use_ssl": use_ssl_flag,
             "verify_certs": verify_certs_flag,
+            "ssl_assert_hostname": ssl_assert_hostname_flag,
             "ssl_show_warn": ssl_show_warn_flag,
             "timeout": timeout,
             "max_retries": 3,
