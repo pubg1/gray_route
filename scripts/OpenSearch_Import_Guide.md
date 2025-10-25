@@ -109,6 +109,9 @@ python import_to_opensearch.py -f ../data/servicingcase_last.json -i automotive_
 | `search_content` | text | 完整搜索内容 |
 | `search_num` | integer | 搜索次数 |
 | `created_at` | date | 创建时间 |
+| `text_vector`* | knn_vector | 语义检索向量 (可选) |
+
+> \* 仅在执行脚本时添加 `--enable-vector` 时创建，该字段使用 `knn_vector` 类型并开启 `index.knn`。
 
 ### 命令行参数
 
@@ -126,6 +129,10 @@ python import_to_opensearch.py [选项]
   -p, --password PASS  密码
   --ssl                使用SSL连接
   --batch-size SIZE    批量导入大小 (默认: 100)
+  --enable-vector      写入语义向量并启用kNN索引配置
+  --vector-field NAME  向量字段名称 (默认: text_vector)
+  --vector-dim DIM     向量维度 (默认: 512)
+  --embedding-model ID 自定义SentenceTransformer模型 (默认复用app.embedding配置)
   --test               导入后进行搜索测试
 ```
 
@@ -149,7 +156,56 @@ python import_to_opensearch.py \
   -f ../data/servicingcase_last.json \
   --batch-size 500 \
   --test
+
+# 启用语义向量写入，构建kNN索引
+python import_to_opensearch.py \
+  -f ../data/servicingcase_last.json \
+  --enable-vector \
+  --vector-field text_vector \
+  --vector-dim 512
 ```
+
+### 选择和下载向量模型
+
+脚本在启用 `--enable-vector` 时需要一个 SentenceTransformer 兼容的嵌入模型。默认情况下会复用应用配置中的 `EMBEDDING_MODEL`（位于 `app/config.py`，默认值为 `BAAI/bge-small-zh-v1.5`）。该模型针对中文语义检索进行了优化，发布在 [Hugging Face](https://huggingface.co/BAAI/bge-small-zh-v1.5) 上。
+
+运行导入脚本时会自动尝试下载并缓存所需的模型：
+
+* 如果环境已安装 `huggingface_hub`，脚本会在导入前调用 `snapshot_download` 预拉取模型文件。可通过设置 `SENTENCE_TRANSFORMERS_HOME` 或 `HF_HOME` 环境变量自定义缓存目录。
+* 若未安装 `huggingface_hub`，则由 `SentenceTransformer` 在首次加载时自动下载到默认缓存目录（通常是 `~/.cache/huggingface`）。
+
+> **提示**：如果你的环境无法联网，可提前在有网络的机器上下载模型，然后拷贝到离线环境的 `~/.cache/huggingface` 或者自定义的 `SENTENCE_TRANSFORMERS_HOME` 目录。
+
+常见的下载方式：
+
+```bash
+# 使用 huggingface-cli 手动拉取（适合离线分发）
+huggingface-cli download BAAI/bge-small-zh-v1.5 --local-dir /path/to/models/bge-small-zh-v1.5
+
+# 或者在 Python 中预先加载，触发自动缓存
+python - <<'PY'
+from sentence_transformers import SentenceTransformer
+SentenceTransformer('BAAI/bge-small-zh-v1.5', trust_remote_code=True)
+PY
+```
+
+若需要使用其他模型，可将模型 ID 传入脚本：
+
+```bash
+python import_to_opensearch.py \
+  -f ../data/servicingcase_last.json \
+  --enable-vector \
+  --embedding-model BAAI/bge-base-zh-v1.5
+```
+
+你也可以设置环境变量覆盖默认值：
+
+```bash
+export EMBEDDING_MODEL="moka-ai/m3e-base"
+python import_to_opensearch.py -f ../data/servicingcase_last.json --enable-vector
+```
+
+选择模型时请确保输出向量维度与 `--vector-dim` 参数一致（常见中文模型如 `bge-small-zh` 为 512 维，`bge-base-zh` 为 768 维）。
 
 ## 搜索测试
 

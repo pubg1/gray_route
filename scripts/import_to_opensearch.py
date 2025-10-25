@@ -5,14 +5,50 @@
 """
 
 import json
+import os
 import re
-from typing import Dict, List, Any, Optional
+import importlib
+from typing import Dict, List, Any, Optional, Tuple
 from opensearchpy import OpenSearch
 from opensearchpy.helpers import bulk
 import argparse
 import sys
 from datetime import datetime
 import logging
+
+# 为了复用应用内的向量模型工具，确保可以导入 app 模块
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+embedding_spec = importlib.util.find_spec("app.embedding")
+if embedding_spec is not None:
+    embedding_module = importlib.import_module("app.embedding")
+    get_embedder = getattr(embedding_module, "get_embedder", None)
+else:  # pragma: no cover - 离线导入脚本允许缺省模型
+    get_embedder = None
+
+sentence_spec = importlib.util.find_spec("sentence_transformers")
+if sentence_spec is not None:
+    sentence_module = importlib.import_module("sentence_transformers")
+    SentenceTransformer = getattr(sentence_module, "SentenceTransformer", None)
+else:  # pragma: no cover - 仅用于命令行导入
+    SentenceTransformer = None
+
+huggingface_spec = importlib.util.find_spec("huggingface_hub")
+if huggingface_spec is not None:
+    huggingface_module = importlib.import_module("huggingface_hub")
+    snapshot_download = getattr(huggingface_module, "snapshot_download", None)
+else:  # pragma: no cover - huggingface_hub 为可选依赖
+    snapshot_download = None
+
+
+class _SentenceTransformerWrapper:
+    def __init__(self, model):
+        self.model = model
+
+    def encode(self, texts: List[str]):
+        return self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
 
 # 配置日志
 logging.basicConfig(
@@ -22,11 +58,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class OpenSearchImporter:
-    def __init__(self, host: str = 'localhost', port: int = 9200, 
-                 username: str = None, password: str = None, 
+    def __init__(self, host: str = 'localhost', port: int = 9200,
+                 username: str = None, password: str = None,
                  use_ssl: bool = False, verify_certs: bool = False,
                  ssl_assert_hostname: bool = True, ssl_show_warn: bool = True,
-                 timeout: int = 30):
+                 timeout: int = 30,
+                 enable_vector: bool = False,
+                 vector_field: str = 'text_vector',
+                 vector_dimension: int = 512,
+                 embedding_model: Optional[str] = None):
         """初始化 OpenSearch 连接"""
         
         # 处理 AWS VPC 端点 URL
@@ -58,6 +98,28 @@ class OpenSearchImporter:
         except Exception as e:
             logger.error(f"连接 OpenSearch 失败: {e}")
             raise
+
+        self.enable_vector = bool(enable_vector)
+        self.vector_field = vector_field if vector_field else None
+        self.vector_dimension = vector_dimension
+        self.embedding_model = embedding_model
+        self.embedder = None
+
+        if self.enable_vector and not self.vector_field:
+            logger.warning("未指定向量字段名称，已禁用语义向量写入功能")
+            self.enable_vector = False
+
+        if self.enable_vector and self.vector_field:
+            self.embedder = self._load_embedder()
+            if self.embedder is not None:
+                logger.info(
+                    "已启用语义向量写入: 字段=%s, 维度=%s",
+                    self.vector_field,
+                    self.vector_dimension,
+                )
+            else:
+                logger.warning("未能加载向量模型，已自动关闭语义向量写入功能")
+                self.enable_vector = False
     
     def clean_html_content(self, text: str) -> str:
         """清理HTML内容"""
@@ -131,6 +193,148 @@ class OpenSearchImporter:
         
         # 移除空值
         return {k: v for k, v in transformed.items() if v is not None and v != ''}
+
+    def _load_embedder(self):
+        """加载向量模型"""
+        model_id = self._infer_model_id()
+        if SentenceTransformer is not None:
+            local_path = self._ensure_model_download(model_id)
+            load_target = local_path or model_id
+            try:
+                model = SentenceTransformer(load_target, trust_remote_code=True)
+                logger.info("已加载 embedding 模型: %s", model_id)
+                embedder = _SentenceTransformerWrapper(model)
+                self._sync_vector_dimension(embedder)
+                return embedder
+            except Exception as model_err:
+                logger.error(f"加载 SentenceTransformer 模型失败: {model_err}")
+
+        if get_embedder is not None:
+            try:
+                embedder = get_embedder()
+                self._sync_vector_dimension(embedder)
+                logger.info("已回退到应用内置 embedding 模型")
+                return embedder
+            except Exception as fallback_err:
+                logger.error(f"加载应用内置 embedding 模型失败: {fallback_err}")
+
+        logger.error("当前环境未能加载任何向量模型，无法写入 knn 向量")
+        return None
+
+    def _infer_model_id(self) -> str:
+        if self.embedding_model:
+            return self.embedding_model
+
+        config_spec = importlib.util.find_spec("app.config")
+        if config_spec is not None:
+            try:
+                config_module = importlib.import_module("app.config")
+                get_settings = getattr(config_module, "get_settings", None)
+                if callable(get_settings):
+                    settings = get_settings()
+                    candidate = getattr(settings, "embedding_model", None)
+                    if candidate:
+                        return str(candidate)
+            except Exception as cfg_err:
+                logger.debug("读取应用默认 embedding 模型失败: %s", cfg_err)
+
+        return "BAAI/bge-small-zh-v1.5"
+
+    def _ensure_model_download(self, model_id: str) -> Optional[str]:
+        if snapshot_download is None:
+            logger.debug("huggingface_hub 未安装，跳过模型预下载")
+            return None
+
+        try:
+            download_kwargs = {"repo_id": model_id, "local_dir_use_symlinks": False}
+            preferred_home = os.environ.get("SENTENCE_TRANSFORMERS_HOME") or os.environ.get("HF_HOME")
+            if preferred_home:
+                target_dir = os.path.join(preferred_home, os.path.basename(model_id))
+                os.makedirs(target_dir, exist_ok=True)
+                download_kwargs["local_dir"] = target_dir
+            local_path = snapshot_download(**download_kwargs)
+            logger.info("embedding 模型已准备就绪: %s", local_path)
+            return local_path
+        except Exception as download_err:
+            logger.warning("预下载 embedding 模型失败: %s", download_err)
+            return None
+
+    def _sync_vector_dimension(self, embedder: Any) -> None:
+        try:
+            preview = embedder.encode(["test"])
+        except Exception as encode_err:
+            raise RuntimeError(f"校验 embedding 模型输出失败: {encode_err}") from encode_err
+
+        if preview is None:
+            raise RuntimeError("embedding 模型未返回向量结果")
+
+        if hasattr(preview, "tolist"):
+            preview_list = preview.tolist()
+        else:
+            preview_list = list(preview)
+
+        if not preview_list:
+            raise RuntimeError("embedding 模型返回空向量")
+
+        first_vector = preview_list[0] if isinstance(preview_list[0], (list, tuple)) else preview_list
+        actual_dim = len(first_vector)
+        if actual_dim != self.vector_dimension:
+            logger.warning(
+                "模型输出维度(%s)与配置维度(%s)不一致，自动更新配置",
+                actual_dim,
+                self.vector_dimension,
+            )
+            self.vector_dimension = int(actual_dim)
+
+    @staticmethod
+    def _build_embedding_text(document: Dict[str, Any]) -> str:
+        """为向量模型准备文本"""
+        parts = [
+            document.get('symptoms', ''),
+            document.get('discussion', ''),
+            document.get('solution', ''),
+            document.get('search_content', ''),
+        ]
+        combined = '\n'.join(part for part in parts if part)
+        return combined.strip()
+
+    def _apply_vectors(self, documents: List[Dict[str, Any]], texts: List[Optional[str]]):
+        if not self.enable_vector or not self.embedder or not self.vector_field:
+            return
+
+        candidates: List[Tuple[int, str]] = [
+            (idx, text) for idx, text in enumerate(texts) if text
+        ]
+        if not candidates:
+            logger.info("没有可用于生成向量的文本")
+            return
+
+        indices, corpora = zip(*candidates)
+        try:
+            vectors = self.embedder.encode(list(corpora))
+        except Exception as e:
+            logger.error(f"批量生成向量失败: {e}")
+            return
+
+        try:
+            vectors_list = vectors.tolist()  # type: ignore[attr-defined]
+        except AttributeError:
+            vectors_list = [list(vec) for vec in vectors]
+
+        applied = 0
+        for doc_idx, vector in zip(indices, vectors_list):
+            if len(vector) != self.vector_dimension:
+                logger.warning(
+                    "文档 %s 的向量维度 %s 与配置 %s 不一致，已跳过",
+                    documents[doc_idx].get('_id'),
+                    len(vector),
+                    self.vector_dimension,
+                )
+                continue
+            documents[doc_idx]['_source'][self.vector_field] = vector
+            applied += 1
+
+        logger.info("已为 %s 条文档写入语义向量", applied)
     
     def create_index_mapping(self, index_name: str):
         """创建索引映射 - 使用简化配置避免AWS限制"""
@@ -138,31 +342,52 @@ class OpenSearchImporter:
             if self.client.indices.exists(index=index_name):
                 logger.info(f"索引 {index_name} 已存在")
                 return True
-            
-            # 使用最简单的配置，让AWS OpenSearch自动处理分片和副本
-            simple_mapping = {
-                "mappings": {
-                    "properties": {
-                        "id": {"type": "keyword"},
-                        "vehicletype": {
-                            "type": "text",
-                            "fields": {"keyword": {"type": "keyword"}}
-                        },
-                        "discussion": {"type": "text"},
-                        "symptoms": {"type": "text"},
-                        "solution": {"type": "text"},
-                        "search_content": {"type": "text"},
-                        "search_num": {"type": "integer"},
-                        "rate": {"type": "float"},
-                        "vin": {"type": "keyword"},
-                        "created_at": {"type": "date"},
-                        "source_index": {"type": "keyword"},
-                        "source_type": {"type": "keyword"}
+
+            properties = {
+                "id": {"type": "keyword"},
+                "vehicletype": {
+                    "type": "text",
+                    "fields": {"keyword": {"type": "keyword"}}
+                },
+                "discussion": {"type": "text"},
+                "symptoms": {"type": "text"},
+                "solution": {"type": "text"},
+                "search_content": {"type": "text"},
+                "search_num": {"type": "integer"},
+                "rate": {"type": "float"},
+                "vin": {"type": "keyword"},
+                "created_at": {"type": "date"},
+                "source_index": {"type": "keyword"},
+                "source_type": {"type": "keyword"},
+            }
+
+            if self.enable_vector and self.vector_field:
+                properties[self.vector_field] = {
+                    "type": "knn_vector",
+                    "dimension": self.vector_dimension,
+                    "method": {
+                        "name": "hnsw",
+                        "space_type": "cosinesimil",
+                        "engine": "nmslib",
+                        "parameters": {
+                            "ef_construction": 128,
+                            "m": 16
+                        }
                     }
                 }
-                # 不设置 settings，让 AWS OpenSearch 使用默认配置
+
+            simple_mapping = {
+                "mappings": {
+                    "properties": properties
+                }
             }
-            
+
+            if self.enable_vector and self.vector_field:
+                simple_mapping["settings"] = {
+                    "index.knn": True,
+                    "index.knn.space_type": "cosinesimil"
+                }
+
             response = self.client.indices.create(index=index_name, body=simple_mapping)
             logger.info(f"成功创建索引: {index_name}")
             return True
@@ -200,11 +425,14 @@ class OpenSearchImporter:
             
             # 转换数据格式
             logger.info("转换数据格式...")
-            documents = []
+            documents: List[Dict[str, Any]] = []
+            embedding_texts: List[Optional[str]] = [] if self.enable_vector else []
             for record in data:
                 try:
                     transformed = self.transform_record(record)
                     if transformed:
+                        if self.enable_vector:
+                            embedding_texts.append(self._build_embedding_text(transformed))
                         # 构建bulk操作格式
                         doc = {
                             "_index": index_name,
@@ -215,8 +443,12 @@ class OpenSearchImporter:
                 except Exception as e:
                     logger.warning(f"转换记录失败: {e}")
                     continue
-            
+
             logger.info(f"成功转换 {len(documents)} 条记录")
+
+            if self.enable_vector and documents:
+                logger.info("开始批量生成语义向量...")
+                self._apply_vectors(documents, embedding_texts)
             
             # 批量导入
             logger.info("开始批量导入...")
@@ -295,8 +527,12 @@ def main():
     parser.add_argument('--password', '-p', help='密码')
     parser.add_argument('--ssl', action='store_true', help='使用SSL')
     parser.add_argument('--batch-size', type=int, default=100, help='批量大小')
+    parser.add_argument('--enable-vector', action='store_true', help='写入语义向量并创建kNN索引')
+    parser.add_argument('--vector-field', default='text_vector', help='向量字段名称 (默认: text_vector)')
+    parser.add_argument('--vector-dim', type=int, default=512, help='向量维度 (默认: 512)')
+    parser.add_argument('--embedding-model', help='自定义 SentenceTransformer 模型名称')
     parser.add_argument('--test', action='store_true', help='导入后进行搜索测试')
-    
+
     args = parser.parse_args()
     
     try:
@@ -306,7 +542,11 @@ def main():
             port=args.port,
             username=args.username,
             password=args.password,
-            use_ssl=args.ssl
+            use_ssl=args.ssl,
+            enable_vector=args.enable_vector,
+            vector_field=args.vector_field,
+            vector_dimension=args.vector_dim,
+            embedding_model=args.embedding_model,
         )
         
         # 导入数据
