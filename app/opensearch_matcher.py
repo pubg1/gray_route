@@ -242,11 +242,28 @@ def _select_highlight(highlight: Dict[str, List[str]], keys: Sequence[str]) -> O
             return fragments[0]
     return None
 
+
+def _parse_version_number(version: str) -> Tuple[int, ...]:
+    """将 OpenSearch 版本号解析为整数元组，便于比较。"""
+
+    if not version:
+        return tuple()
+    numeric_part = version.split("-")[0]
+    parts = [part for part in re.split(r"[^0-9]+", numeric_part) if part]
+    if not parts:
+        return tuple()
+    try:
+        return tuple(int(part) for part in parts)
+    except ValueError:
+        return tuple()
+
 class OpenSearchMatcher:
     """基于 OpenSearch 的故障现象匹配器"""
     
     def __init__(self):
         """初始化 OpenSearch 连接"""
+        self.server_version = ''
+        version_tuple: Tuple[int, ...] = tuple()
         try:
             self.client = OpenSearch(
                 hosts=[{
@@ -263,7 +280,9 @@ class OpenSearchMatcher:
             
             # 测试连接
             info = self.client.info()
-            logger.info(f"OpenSearch 连接成功: {info['version']['number']}")
+            self.server_version = str(info.get('version', {}).get('number', ''))
+            version_tuple = _parse_version_number(self.server_version)
+            logger.info(f"OpenSearch 连接成功: {self.server_version}")
             
         except Exception as e:
             logger.error(f"OpenSearch 连接失败: {e}")
@@ -275,6 +294,14 @@ class OpenSearchMatcher:
 
         self.embedder = None
         self.semantic_available = False
+        self._knn_query_style = 'top_level'
+        version_major_minor = version_tuple[:2] if version_tuple else tuple()
+        if version_major_minor and version_major_minor < (2, 9):
+            self._knn_query_style = 'nested'
+            logger.info(
+                "检测到 OpenSearch 版本 %s 不支持顶层 kNN 查询，默认使用 bool.must 语法",
+                self.server_version
+            )
         if get_embedder is not None:
             try:
                 self.embedder = get_embedder()
@@ -345,6 +372,60 @@ class OpenSearchMatcher:
                 }
             })
         return filters
+
+    def _build_knn_body(self,
+                        query_vector: Sequence[float],
+                        vector_k: int,
+                        filters: Sequence[Dict]) -> Dict[str, Any]:
+        filter_clauses = list(filters or [])
+        bool_query: Dict[str, Any] = {}
+        if filter_clauses:
+            bool_query["filter"] = filter_clauses
+
+        num_candidates = max(vector_k * 4, self.vector_num_candidates)
+
+        if self._knn_query_style == 'nested':
+            knn_clause = {
+                "knn": {
+                    self.vector_field: {
+                        "vector": list(query_vector),
+                        "k": vector_k,
+                        "num_candidates": num_candidates,
+                    }
+                }
+            }
+            bool_query.setdefault("must", [])
+            bool_query["must"].append(knn_clause)
+            return {
+                "size": vector_k,
+                "query": {
+                    "bool": bool_query
+                }
+            }
+
+        return {
+            "size": vector_k,
+            "query": {
+                "bool": bool_query
+            },
+            "knn": {
+                "field": self.vector_field,
+                "query_vector": list(query_vector),
+                "k": vector_k,
+                "num_candidates": num_candidates
+            }
+        }
+
+    @staticmethod
+    def _should_use_nested_knn(error: Exception) -> bool:
+        message = str(error)
+        keywords = [
+            "Unknown key for a START_OBJECT in [knn]",
+            "Unknown key for a FIELD_NAME in [knn]",
+            "Failed to parse [knn]",
+            "parsing_exception",
+        ]
+        return any(keyword in message for keyword in keywords)
 
     def _encode_query(self, query: str) -> Optional[List[float]]:
         if not self.embedder:
@@ -484,25 +565,37 @@ class OpenSearchMatcher:
             if effective_semantic and self.vector_field:
                 query_vector = self._encode_query(query)
                 if query_vector is not None:
-                    knn_body = {
-                        "size": vector_k,
-                        "query": {
-                            "bool": {
-                                "filter": filters
-                            }
-                        },
-                        "knn": {
-                            "field": self.vector_field,
-                            "query_vector": query_vector,
-                            "k": vector_k,
-                            "num_candidates": max(vector_k * 4, self.vector_num_candidates)
-                        }
-                    }
+                    knn_body = self._build_knn_body(query_vector, vector_k, filters)
                     try:
                         knn_resp = self.client.search(
                             index=INDEX_CONFIG['name'],
                             body=knn_body
                         )
+                    except Exception as knn_err:
+                        if (
+                            self._knn_query_style == 'top_level'
+                            and self._should_use_nested_knn(knn_err)
+                        ):
+                            logger.warning(
+                                "顶层 kNN 查询失败，自动回退到 bool.must 语法: %s",
+                                knn_err
+                            )
+                            self._knn_query_style = 'nested'
+                            knn_body = self._build_knn_body(query_vector, vector_k, filters)
+                            try:
+                                knn_resp = self.client.search(
+                                    index=INDEX_CONFIG['name'],
+                                    body=knn_body
+                                )
+                            except Exception as nested_err:
+                                logger.error(f"语义检索失败: {nested_err}")
+                                effective_semantic = False
+                                knn_resp = None
+                        else:
+                            logger.error(f"语义检索失败: {knn_err}")
+                            effective_semantic = False
+                            knn_resp = None
+                    if knn_resp:
                         for hit in knn_resp['hits']['hits']:
                             doc_id, source = self._extract_source(hit)
                             semantic_raw = float(hit.get('_score') or 0.0)
@@ -531,9 +624,6 @@ class OpenSearchMatcher:
                             item['sources'] = list(sources)
                             if not item.get('highlight'):
                                 item['highlight'] = hit.get('highlight', {})
-                    except Exception as knn_err:
-                        logger.error(f"语义检索失败: {knn_err}")
-                        effective_semantic = False
 
             bm25_stats = compute_stats(
                 item.get('bm25_raw')
