@@ -4,6 +4,12 @@
 测试 POST 接口的安全性和功能
 """
 
+import pytest
+
+pytestmark = pytest.mark.skip(
+    reason="Requires a running API service at 127.0.0.1:8000; skipped in automated tests."
+)
+
 import requests
 import json
 import time

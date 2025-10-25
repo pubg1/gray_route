@@ -4,6 +4,16 @@
 AWS OpenSearch VPC 端点连接测试脚本
 """
 
+try:  # pragma: no cover - pytest not required for manual execution
+    import pytest
+except Exception:  # pragma: no cover
+    pytest = None
+
+if pytest is not None:  # pragma: no cover - evaluated only in pytest context
+    pytestmark = pytest.mark.skip(
+        reason="VPC connectivity helper script; skip during automated pytest runs."
+    )
+
 import sys
 import ssl
 import socket

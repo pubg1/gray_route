@@ -5,6 +5,16 @@
 测试 OpenSearch 导入和故障现象匹配功能
 """
 
+try:  # pragma: no cover - allow running script without pytest installed
+    import pytest
+except Exception:  # pragma: no cover
+    pytest = None
+
+if pytest is not None:  # pragma: no cover - only evaluated inside pytest
+    pytestmark = pytest.mark.skip(
+        reason="System integration helper script; skip during automated pytest runs."
+    )
+
 import sys
 import os
 import json
