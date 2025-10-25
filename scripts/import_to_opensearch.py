@@ -227,6 +227,8 @@ class OpenSearchImporter:
         embedding_model: Optional[str] = None,
         model_cache_dir: Optional[str] = None,
         clone_source_index: Optional[str] = "automotive_cases",
+        preserve_source_fields: bool = False,
+        recreate_index: bool = False,
     ) -> None:
         """初始化 OpenSearch 连接并准备向量写入。"""
 
@@ -295,6 +297,15 @@ class OpenSearchImporter:
             logger.error("连接 OpenSearch 失败: %s", exc)
             raise
 
+        try:
+            preserve_flag = self._coerce_bool(
+                "preserve_source_fields", preserve_source_fields
+            )
+            recreate_flag = self._coerce_bool("recreate_index", recreate_index)
+        except ValueError as exc:
+            logger.error("无效的 OpenSearch 连接配置: %s", exc)
+            raise
+
         self.enable_vector = bool(enable_vector)
         self.vector_field = vector_field.strip() if vector_field else ""
         self.vector_dimension = vector_dimension
@@ -303,6 +314,8 @@ class OpenSearchImporter:
         self.clone_source_index = (
             clone_source_index.strip() if clone_source_index else None
         )
+        self.preserve_source_fields = preserve_flag
+        self.recreate_index = recreate_flag
         self.embedder: Optional[Any] = None
         self._prepared_model_path: Optional[str] = None
 
@@ -507,6 +520,35 @@ class OpenSearchImporter:
             logger.debug("记录缺少 id，已跳过: %s", record)
             return None
 
+        if self.preserve_source_fields:
+            if (
+                "id" not in transformed
+                or self._should_replace_field(transformed.get("id"))
+            ):
+                transformed["id"] = doc_id
+
+            if (
+                self.enable_vector
+                and self.embedder is not None
+                and self.vector_field
+                and (
+                    self.vector_field not in transformed
+                    or self._should_replace_field(transformed.get(self.vector_field))
+                )
+            ):
+                text_for_vector = (
+                    transformed.get("search_content")
+                    or transformed.get("search")
+                    or transformed.get("discussion")
+                    or transformed.get("symptoms")
+                    or ""
+                )
+                vector = self._build_vector(text_for_vector)
+                if vector is not None:
+                    transformed[self.vector_field] = vector
+
+            return transformed
+
         transformed.setdefault("id", doc_id)
         transformed.setdefault("source_index", record.get("_index"))
         transformed.setdefault("source_type", record.get("_type"))
@@ -640,11 +682,55 @@ class OpenSearchImporter:
 
     def create_index_mapping(self, index_name: str) -> bool:
         try:
+            response = self.client.indices.get_mapping(index=source_index)
+        except Exception as exc:
+            logger.warning("无法读取源索引 %s 的映射: %s", source_index, exc)
+            return None
+
+        mapping = response.get(source_index, {}).get("mappings")
+        if not mapping:
+            return None
+
+        return copy.deepcopy(mapping)
+
+    def _build_default_mapping(self) -> Dict[str, Any]:
+        return {
+            "mappings": {
+                "properties": {
+                    "id": {"type": "keyword"},
+                    "vehicletype": {
+                        "type": "text",
+                        "fields": {"keyword": {"type": "keyword"}},
+                    },
+                    "discussion": {"type": "text"},
+                    "symptoms": {"type": "text"},
+                    "solution": {"type": "text"},
+                    "search_content": {"type": "text"},
+                    "search_num": {"type": "integer"},
+                    "rate": {"type": "float"},
+                    "vin": {"type": "keyword"},
+                    "created_at": {"type": "date"},
+                    "source_index": {"type": "keyword"},
+                    "source_type": {"type": "keyword"},
+                }
+            }
+        }
+
+    def create_index_mapping(self, index_name: str) -> bool:
+        try:
             if self.client.indices.exists(index=index_name):
-                logger.info("索引 %s 已存在", index_name)
-                if self.enable_vector:
-                    self._ensure_vector_compat(index_name)
-                return True
+                if self.recreate_index:
+                    try:
+                        logger.info("索引 %s 已存在，将删除后重新创建", index_name)
+                        self.client.indices.delete(index=index_name)
+                    except Exception as exc:
+                        logger.error("删除已存在索引失败: %s", exc)
+                        return False
+                else:
+                    logger.info("索引 %s 已存在", index_name)
+                    if self.enable_vector:
+                        self._ensure_vector_compat(index_name)
+                    return True
 
             body: Dict[str, Any]
             cloned = False
@@ -881,6 +967,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default="automotive_cases",
         help="从指定索引克隆映射，保留所有原字段",
     )
+    parser.add_argument(
+        "--preserve-source-fields",
+        action="store_true",
+        help="保持原始 _source 字段不做额外填充，仅追加向量字段",
+    )
+    parser.add_argument(
+        "--recreate-index",
+        action="store_true",
+        help="若索引已存在则删除后重新创建",
+    )
 
     parser.add_argument("--test", action="store_true", help="导入完成后执行一次示例查询")
     return parser.parse_args(argv)
@@ -904,6 +1000,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             embedding_model=args.embedding_model,
             model_cache_dir=args.model_cache,
             clone_source_index=args.clone_mapping_from,
+            preserve_source_fields=args.preserve_source_fields,
+            recreate_index=args.recreate_index,
         )
     except ValueError:
         return 1

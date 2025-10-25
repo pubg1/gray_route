@@ -26,6 +26,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 DATA_FILE="${1:-${OPENSEARCH_DATA_FILE:-${ROOT_DIR}/data/servicingcase_last.json}}"
+ORIGINAL_DATA_FILE="${DATA_FILE}"
 
 if [[ ! -f "${DATA_FILE}" ]]; then
   echo "[错误] 数据文件不存在: ${DATA_FILE}" >&2
@@ -76,6 +77,13 @@ TIMEOUT_DEFAULT=$(read_config_value timeout)
 HOST=${OPENSEARCH_HOST:-${HOST_DEFAULT:-localhost}}
 PORT=${OPENSEARCH_PORT:-${PORT_DEFAULT:-9200}}
 INDEX=${OPENSEARCH_INDEX:-cases}
+if [[ -z "${OPENSEARCH_INDEX:-}" ]]; then
+  data_basename=$(basename "${ORIGINAL_DATA_FILE}")
+  data_lower=$(echo "${data_basename}" | tr 'A-Z' 'a-z')
+  if [[ "${data_lower}" == case_recovery.zip || "${data_lower}" == case_recovery.sql ]]; then
+    INDEX=cases_recovery
+  fi
+fi
 USERNAME=${OPENSEARCH_USERNAME:-${USERNAME_DEFAULT}}
 PASSWORD=${OPENSEARCH_PASSWORD:-${PASSWORD_DEFAULT}}
 SSL_FLAG=${OPENSEARCH_SSL:-${SSL_DEFAULT:-false}}
@@ -123,7 +131,9 @@ CMD=("${PYTHON_BIN}" "${SCRIPT_DIR}/import_to_opensearch.py"
   "--clone-mapping-from" "automotive_cases"
   "--enable-vector"
   "--vector-field" "${VECTOR_FIELD}"
-  "--vector-dim" "${VECTOR_DIM}")
+  "--vector-dim" "${VECTOR_DIM}"
+  "--preserve-source-fields"
+  "--recreate-index")
 
 if [[ -n "${USERNAME}" && -n "${PASSWORD}" ]]; then
   CMD+=("--username" "${USERNAME}" "--password" "${PASSWORD}")
