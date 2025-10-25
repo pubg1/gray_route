@@ -235,6 +235,9 @@ class OpenSearchImporter:
         try:
             use_ssl_flag = self._coerce_bool("use_ssl", use_ssl)
             verify_certs_flag = self._coerce_bool("verify_certs", verify_certs)
+            ssl_assert_hostname_flag = self._coerce_bool(
+                "ssl_assert_hostname", ssl_assert_hostname, default=True
+            )
             ssl_show_warn_flag = self._coerce_bool(
                 "ssl_show_warn", ssl_show_warn, default=True
             )
@@ -269,6 +272,7 @@ class OpenSearchImporter:
             "http_compress": True,
             "use_ssl": use_ssl_flag,
             "verify_certs": verify_certs_flag,
+            "ssl_assert_hostname": ssl_assert_hostname_flag,
             "ssl_show_warn": ssl_show_warn_flag,
             "timeout": timeout,
             "max_retries": 3,
@@ -641,6 +645,42 @@ class OpenSearchImporter:
     # 索引管理 & 导入流程
     # ------------------------------------------------------------------
     def _fetch_source_mapping(self, source_index: str) -> Optional[Dict[str, Any]]:
+        try:
+            response = self.client.indices.get_mapping(index=source_index)
+        except Exception as exc:
+            logger.warning("无法读取源索引 %s 的映射: %s", source_index, exc)
+            return None
+
+        mapping = response.get(source_index, {}).get("mappings")
+        if not mapping:
+            return None
+
+        return copy.deepcopy(mapping)
+
+    def _build_default_mapping(self) -> Dict[str, Any]:
+        return {
+            "mappings": {
+                "properties": {
+                    "id": {"type": "keyword"},
+                    "vehicletype": {
+                        "type": "text",
+                        "fields": {"keyword": {"type": "keyword"}},
+                    },
+                    "discussion": {"type": "text"},
+                    "symptoms": {"type": "text"},
+                    "solution": {"type": "text"},
+                    "search_content": {"type": "text"},
+                    "search_num": {"type": "integer"},
+                    "rate": {"type": "float"},
+                    "vin": {"type": "keyword"},
+                    "created_at": {"type": "date"},
+                    "source_index": {"type": "keyword"},
+                    "source_type": {"type": "keyword"},
+                }
+            }
+        }
+
+    def create_index_mapping(self, index_name: str) -> bool:
         try:
             response = self.client.indices.get_mapping(index=source_index)
         except Exception as exc:
