@@ -187,7 +187,7 @@ class OpenSearchImporter:
         password: Optional[str] = None,
         use_ssl: bool = False,
         verify_certs: bool = False,
-        ssl_assert_hostname: bool = True,
+        ssl_assert_hostname: Any = True,
         ssl_show_warn: bool = True,
         timeout: int = 30,
         enable_vector: bool = False,
