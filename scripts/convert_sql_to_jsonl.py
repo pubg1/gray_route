@@ -27,8 +27,8 @@ from zipfile import ZipFile
 
 LOGGER = logging.getLogger(__name__)
 
-INSERT_REGEX = re.compile(
-    r"INSERT\s+INTO\s+`?(?P<table>[^`(\s]+)`?\s*(?P<columns>\([^)]*\))?\s*VALUES\s*(?P<values>.+?);",
+INSERT_HEAD_REGEX = re.compile(
+    r"INSERT\s+INTO\s+`?(?P<table>[^`(\s]+)`?\s*(?P<columns>\([^)]*\))?\s*VALUES\s*",
     re.IGNORECASE | re.DOTALL,
 )
 CREATE_TABLE_REGEX = re.compile(
@@ -358,10 +358,72 @@ def iter_insert_statements(
     *,
     column_definitions: Optional[Dict[str, Sequence[str]]] = None,
 ) -> Iterator[InsertStatement]:
-    for match in INSERT_REGEX.finditer(sql_text):
+    position = 0
+    length = len(sql_text)
+
+    while True:
+        match = INSERT_HEAD_REGEX.search(sql_text, position)
+        if not match:
+            break
+
         table = match.group("table")
         raw_columns = match.group("columns")
-        values_block = match.group("values")
+        values_start = match.end()
+        index = values_start
+        in_string: Optional[str] = None
+        escape = False
+        depth = 0
+        values_block: Optional[str] = None
+
+        while index < length:
+            char = sql_text[index]
+
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == in_string:
+                    if char == "'" and index + 1 < length and sql_text[index + 1] == "'":
+                        index += 1
+                    else:
+                        in_string = None
+                index += 1
+                continue
+
+            if char in ("'", '"'):
+                in_string = char
+                index += 1
+                continue
+
+            if char == "(":
+                depth += 1
+                index += 1
+                continue
+
+            if char == ")":
+                if depth > 0:
+                    depth -= 1
+                index += 1
+                continue
+
+            if char == ";" and depth == 0:
+                values_block = sql_text[values_start:index]
+                index += 1
+                break
+
+            index += 1
+
+        if values_block is None:
+            values_block = sql_text[values_start:].rstrip()
+            index = length
+
+        position = index
+
+        values_block = values_block.strip()
+        if not values_block:
+            continue
+
         try:
             for tuple_text in _split_value_tuples(values_block):
                 parsed_values = _parse_value_tuple(tuple_text)
