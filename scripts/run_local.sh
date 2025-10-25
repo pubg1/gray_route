@@ -5,15 +5,35 @@ set -euo pipefail
 APP_NAME="codex-gray-route"
 HOST="0.0.0.0"
 PORT="8080"
-PID_FILE="./logs/${APP_NAME}.pid"
-LOG_FILE="./logs/${APP_NAME}.log"
-ERROR_LOG_FILE="./logs/${APP_NAME}.error.log"
+
+# 兼容任意工作目录执行脚本
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$ROOT_DIR"
+
+PID_FILE="$ROOT_DIR/logs/${APP_NAME}.pid"
+LOG_FILE="$ROOT_DIR/logs/${APP_NAME}.log"
+ERROR_LOG_FILE="$ROOT_DIR/logs/${APP_NAME}.error.log"
 
 # 创建日志目录
 mkdir -p logs
 
 # 激活虚拟环境
-source .venv/bin/activate
+VENV_ACTIVATE="$ROOT_DIR/.venv/bin/activate"
+if [ ! -f "$VENV_ACTIVATE" ]; then
+    echo "❌ 未找到虚拟环境: $VENV_ACTIVATE"
+    echo "   请先执行以下命令完成环境初始化："
+    echo "     python -m venv .venv"
+    echo "     source .venv/bin/activate"
+    if [ -f "$ROOT_DIR/requirements.txt" ]; then
+        echo "     pip install -r requirements.txt"
+    elif [ -f "$ROOT_DIR/requirements-macos.txt" ]; then
+        echo "     pip install -r requirements-macos.txt"
+    fi
+    exit 1
+fi
+
+source "$VENV_ACTIVATE"
 export PYTHONUNBUFFERED=1
 
 # 检查是否已经在运行

@@ -3,9 +3,15 @@ set -euo pipefail
 
 # 配置
 APP_NAME="codex-gray-route"
-PID_FILE="./logs/${APP_NAME}.pid"
-LOG_FILE="./logs/${APP_NAME}.log"
-ERROR_LOG_FILE="./logs/${APP_NAME}.error.log"
+
+# 兼容任意工作目录执行脚本
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$ROOT_DIR"
+
+PID_FILE="$ROOT_DIR/logs/${APP_NAME}.pid"
+LOG_FILE="$ROOT_DIR/logs/${APP_NAME}.log"
+ERROR_LOG_FILE="$ROOT_DIR/logs/${APP_NAME}.error.log"
 
 echo "🛑 停止 $APP_NAME 服务..."
 
