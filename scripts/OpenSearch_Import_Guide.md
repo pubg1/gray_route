@@ -165,6 +165,43 @@ python import_to_opensearch.py \
   --vector-dim 512
 ```
 
+### 选择和下载向量模型
+
+脚本在启用 `--enable-vector` 时需要一个 SentenceTransformer 兼容的嵌入模型。默认情况下会复用应用配置中的 `EMBEDDING_MODEL`（位于 `app/config.py`，默认值为 `BAAI/bge-small-zh-v1.5`）。该模型针对中文语义检索进行了优化，发布在 [Hugging Face](https://huggingface.co/BAAI/bge-small-zh-v1.5) 上，首次使用时会自动下载到本地缓存。
+
+> **提示**：如果你的环境无法联网，可提前在有网络的机器上下载模型，然后拷贝到离线环境的 `~/.cache/huggingface` 或者自定义的 `SENTENCE_TRANSFORMERS_HOME` 目录。
+
+常见的下载方式：
+
+```bash
+# 使用 huggingface-cli 手动拉取（适合离线分发）
+huggingface-cli download BAAI/bge-small-zh-v1.5 --local-dir /path/to/models/bge-small-zh-v1.5
+
+# 或者在 Python 中预先加载，触发自动缓存
+python - <<'PY'
+from sentence_transformers import SentenceTransformer
+SentenceTransformer('BAAI/bge-small-zh-v1.5', trust_remote_code=True)
+PY
+```
+
+若需要使用其他模型，可将模型 ID 传入脚本：
+
+```bash
+python import_to_opensearch.py \
+  -f ../data/servicingcase_last.json \
+  --enable-vector \
+  --embedding-model BAAI/bge-base-zh-v1.5
+```
+
+你也可以设置环境变量覆盖默认值：
+
+```bash
+export EMBEDDING_MODEL="moka-ai/m3e-base"
+python import_to_opensearch.py -f ../data/servicingcase_last.json --enable-vector
+```
+
+选择模型时请确保输出向量维度与 `--vector-dim` 参数一致（常见中文模型如 `bge-small-zh` 为 512 维，`bge-base-zh` 为 768 维）。
+
 ## 搜索测试
 
 导入完成后，可以进行搜索测试：
