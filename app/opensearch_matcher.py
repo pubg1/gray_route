@@ -7,9 +7,10 @@
 
 import math
 import os
+import re
 import sys
 import logging
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from opensearchpy import OpenSearch
 
@@ -25,6 +26,221 @@ except Exception:  # pragma: no cover - 仅在模型不可用时触发
     get_embedder = None
 
 logger = logging.getLogger(__name__)
+
+
+PHENOMENA_MULTI_MATCH_FIELDS: List[str] = [
+    "text^3.0",
+    "symptoms^3.0",
+    "symptom^3.0",
+    "fault_symptom^3.0",
+    "faultSymptom^3.0",
+    "symptom_desc^2.8",
+    "symptomDesc^2.8",
+    "topic^2.5",
+    "summary^2.3",
+    "discussion^2.5",
+    "fault_point^2.5",
+    "faultPoint^2.5",
+    "analysis^2.0",
+    "search_content^2.0",
+    "searchContent^2.0",
+    "search^1.8",
+    "solution^1.8",
+    "part^1.5",
+    "component^1.5",
+    "system^1.5",
+    "system_name^1.3",
+    "vehicletype^1.5",
+    "vehicle_model^1.5",
+    "vehicle_name^1.3",
+    "vehiclename^1.3",
+    "vehiclebrand^1.3",
+    "vehicle_brand^1.3",
+    "brand^1.3",
+    "spare2^1.0",
+    "spare4^1.0",
+    "faultcode^0.8",
+    "fault_code^0.8",
+    "dtc^0.8",
+]
+
+FAULT_POINT_TEXT_FIELDS: List[str] = [
+    "discussion^3.0",
+    "fault_point^3.0",
+    "faultPoint^3.0",
+    "symptoms^2.5",
+    "fault_symptom^2.5",
+    "symptom^2.0",
+    "text^2.0",
+    "topic^1.5",
+    "summary^1.5",
+    "solution^1.2",
+]
+
+VEHICLE_NAME_FIELDS: List[str] = [
+    "vehicletype^2.0",
+    "vehicle_model^2.0",
+    "vehicle_name^1.8",
+    "vehiclename^1.8",
+    "topic^1.5",
+    "symptoms",
+    "searchContent",
+    "search_content",
+    "search",
+]
+
+CONTROL_UNIT_FIELDS: List[str] = [
+    "part^2.0",
+    "component^2.0",
+    "component_name^2.0",
+    "control_unit^2.0",
+    "system^1.5",
+    "discussion^1.2",
+    "fault_point^1.2",
+    "spare2",
+    "spare1",
+]
+
+FAULT_CODE_FIELDS: List[str] = [
+    "faultcode",
+    "fault_code",
+    "dtc",
+    "dtc_code",
+    "spare4",
+]
+
+MODEL_YEAR_FIELDS: List[str] = [
+    "modelyear",
+    "model_year",
+    "year",
+    "spare1",
+    "spare15",
+    "vehicletype",
+]
+
+
+def _pick_first(source: Dict[str, Any], keys: Sequence[str], *, default: Any = None) -> Any:
+    for key in keys:
+        if not key:
+            continue
+        value = source.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                return stripped
+            continue
+        if isinstance(value, list):
+            if value:
+                return value
+            continue
+        if isinstance(value, dict):
+            if value:
+                return value
+            continue
+        return value
+    return default
+
+
+def _normalize_tags(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        parts = re.split(r"[,，;；\s]+", value)
+        return [part.strip() for part in parts if part.strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    try:
+        text = str(value).strip()
+        if not text:
+            return default
+        return float(text)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_int(value: Any, default: int = 0) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    try:
+        text = str(value).strip()
+        if not text:
+            return default
+        return int(float(text))
+    except (TypeError, ValueError):
+        return default
+
+
+def _extract_common_fields(source: Dict[str, Any]) -> Dict[str, Any]:
+    brand = _pick_first(source, ["vehiclebrand", "vehicle_brand", "brand", "car_brand"], default="") or ""
+    vehicletype = _pick_first(source, ["vehicletype", "vehicle_model", "vehicle_name", "vehiclename", "model", "series", "car_model"], default="") or ""
+    modelyear = _pick_first(source, ["modelyear", "model_year", "year", "spare1"], default="") or ""
+    search_content = _pick_first(source, ["searchContent", "search_content", "search"], default="") or ""
+
+    fields: Dict[str, Any] = {
+        "text": _pick_first(source, [
+            "text",
+            "fault_symptom",
+            "symptoms",
+            "symptom",
+            "summary",
+            "fault_description",
+            "fault_desc",
+            "discussion",
+            "fault_point",
+        ], default="") or "",
+        "system": _pick_first(source, ["system", "system_name", "systemCategory", "system_category"], default="") or "",
+        "part": _pick_first(source, ["part", "component", "component_name", "control_unit", "fault_part"], default="") or "",
+        "tags": _normalize_tags(_pick_first(source, ["tags", "labels", "tag_list"], default=[])),
+        "vehicletype": vehicletype,
+        "vehiclebrand": brand,
+        "topic": _pick_first(source, ["topic", "category", "fault_category", "fault_type"], default="") or "",
+        "symptoms": _pick_first(source, ["symptoms", "fault_symptom", "symptom", "text"], default="") or "",
+        "discussion": _pick_first(source, ["discussion", "fault_point", "fault_location", "faultDescription", "analysis"], default="") or "",
+        "solution": _pick_first(source, ["solution", "repair_solution", "measure", "fix"], default="") or "",
+        "egon": source.get('egon', ''),
+        "spare1": modelyear,
+        "spare2": _pick_first(source, ["spare2", "component", "component_name", "control_unit"], default="") or "",
+        "spare4": _pick_first(source, ["spare4", "faultcode", "fault_code", "dtc", "code"], default="") or "",
+        "spare15": _pick_first(source, ["spare15", "series", "subseries"], default="") or "",
+        "faultcode": _pick_first(source, ["faultcode", "fault_code", "dtc", "code", "spare4"], default="") or "",
+        "createtime": source.get('createtime', ''),
+        "money": source.get('money', ''),
+        "popularity": _coerce_float(_pick_first(source, ["popularity", "popularity_score"], default=0.0)),
+        "searchNum": _coerce_int(_pick_first(source, ["searchNum", "search_num"], default=0)),
+        "rate": source.get('rate'),
+        "modelyear": modelyear,
+        "searchContent": search_content,
+        "search_content": search_content,
+        "brand": brand,
+        "vehicle_brand": brand,
+        "vehicle_model": vehicletype,
+    }
+
+    return fields
+
+
+def _select_highlight(highlight: Dict[str, List[str]], keys: Sequence[str]) -> Optional[str]:
+    for key in keys:
+        fragments = highlight.get(key)
+        if fragments:
+            return fragments[0]
+    return None
 
 class OpenSearchMatcher:
     """基于 OpenSearch 的故障现象匹配器"""
@@ -76,13 +292,58 @@ class OpenSearchMatcher:
                        fault_code: Optional[str]) -> List[Dict]:
         filters: List[Dict] = []
         if system:
-            filters.append({"term": {"system.keyword": system}})
+            system_should: List[Dict[str, Any]] = [
+                {"term": {"system.keyword": system}},
+                {"term": {"system_name.keyword": system}},
+                {"match_phrase": {"system": system}},
+                {"match_phrase": {"system_name": system}},
+            ]
+            filters.append({
+                "bool": {
+                    "should": system_should,
+                    "minimum_should_match": 1,
+                }
+            })
         if part:
-            filters.append({"match": {"part": part}})
+            filters.append({
+                "multi_match": {
+                    "query": part,
+                    "fields": [
+                        "part^2.0",
+                        "component^2.0",
+                        "component_name^2.0",
+                        "control_unit^1.5",
+                        "fault_point^1.2",
+                    ],
+                    "type": "best_fields",
+                }
+            })
         if vehicletype:
-            filters.append({"term": {"vehicletype.keyword": vehicletype}})
+            filters.append({
+                "multi_match": {
+                    "query": vehicletype,
+                    "fields": [
+                        "vehicletype^2.0",
+                        "vehicle_model^2.0",
+                        "vehicle_name^1.5",
+                        "vehiclename^1.5",
+                        "model^1.2",
+                        "series^1.2",
+                    ],
+                    "type": "best_fields",
+                }
+            })
         if fault_code:
-            filters.append({"match": {"spare4": fault_code}})
+            should: List[Dict[str, Any]] = [
+                {"match_phrase": {field: fault_code}}
+                for field in FAULT_CODE_FIELDS
+            ]
+            filters.append({
+                "bool": {
+                    "should": should,
+                    "minimum_should_match": 1,
+                }
+            })
         return filters
 
     def _encode_query(self, query: str) -> Optional[List[float]]:
@@ -123,25 +384,7 @@ class OpenSearchMatcher:
                         "must": {
                             "multi_match": {
                                 "query": query,
-                                "fields": [
-                                    "text^3.0",
-                                    "symptoms^2.8",
-                                    "topic^2.5",
-                                    "discussion^2.5",
-                                    "spare2^2.3",
-                                    "spare4^2.2",
-                                    "searchContent^2.0",
-                                    "search_content^2.0",
-                                    "part^2.0",
-                                    "spare1^1.8",
-                                    "spare15^1.8",
-                                    "egon^1.5",
-                                    "vehicletype^1.5",
-                                    "vehiclebrand^1.3",
-                                    "search^1.0",
-                                    "solution^1.0",
-                                    "faultcode^0.8"
-                                ],
+                                "fields": PHENOMENA_MULTI_MATCH_FIELDS,
                                 "type": "best_fields",
                                 "fuzziness": "AUTO",
                                 "minimum_should_match": "75%"
@@ -152,6 +395,11 @@ class OpenSearchMatcher:
                             {
                                 "range": {
                                     "popularity": {"gte": 50}
+                                }
+                            },
+                            {
+                                "range": {
+                                    "popularity_score": {"gte": 50}
                                 }
                             }
                         ]
@@ -166,7 +414,25 @@ class OpenSearchMatcher:
                             "pre_tags": ["<mark>"],
                             "post_tags": ["</mark>"]
                         },
+                        "symptoms": {
+                            "fragment_size": 150,
+                            "number_of_fragments": 1,
+                            "pre_tags": ["<mark>"],
+                            "post_tags": ["</mark>"]
+                        },
+                        "fault_symptom": {
+                            "fragment_size": 150,
+                            "number_of_fragments": 1,
+                            "pre_tags": ["<mark>"],
+                            "post_tags": ["</mark>"]
+                        },
                         "discussion": {
+                            "fragment_size": 100,
+                            "number_of_fragments": 1,
+                            "pre_tags": ["<mark>"],
+                            "post_tags": ["</mark>"]
+                        },
+                        "fault_point": {
                             "fragment_size": 100,
                             "number_of_fragments": 1,
                             "pre_tags": ["<mark>"],
@@ -191,30 +457,11 @@ class OpenSearchMatcher:
             for hit in response['hits']['hits']:
                 doc_id, source = self._extract_source(hit)
                 bm25_raw = float(hit.get('_score') or 0.0)
+                fields = _extract_common_fields(source)
                 merged[doc_id] = {
                     "id": doc_id,
-                    "text": source.get('text', ''),
-                    "system": source.get('system', ''),
-                    "part": source.get('part', ''),
-                    "tags": source.get('tags', []),
-                    "vehicletype": source.get('vehicletype', ''),
-                    "vehiclebrand": source.get('vehiclebrand', ''),
-                    "topic": source.get('topic', ''),
-                    "symptoms": source.get('symptoms', ''),
-                    "discussion": source.get('discussion', ''),
-                    "solution": source.get('solution', ''),
-                    "egon": source.get('egon', ''),
-                    "spare1": source.get('spare1', ''),
-                    "spare2": source.get('spare2', ''),
-                    "spare4": source.get('spare4', ''),
-                    "spare15": source.get('spare15', ''),
-                    "faultcode": source.get('faultcode', ''),
-                    "createtime": source.get('createtime', ''),
-                    "money": source.get('money', ''),
-                    "popularity": source.get('popularity', 0),
-                    "searchNum": source.get('searchNum', 0),
-                    "rate": source.get('rate'),
-                    "highlight": hit.get('highlight', {}),
+                    **fields,
+                    "highlight": hit.get('highlight', {}) or {},
                     "sources": ["keyword"],
                     "bm25_raw": bm25_raw,
                     "semantic_raw": 0.0,
@@ -260,30 +507,11 @@ class OpenSearchMatcher:
                             semantic_raw = float(hit.get('_score') or 0.0)
                             item = merged.get(doc_id)
                             if not item:
+                                fields = _extract_common_fields(source)
                                 item = {
                                     "id": doc_id,
-                                    "text": source.get('text', ''),
-                                    "system": source.get('system', ''),
-                                    "part": source.get('part', ''),
-                                    "tags": source.get('tags', []),
-                                    "vehicletype": source.get('vehicletype', ''),
-                                    "vehiclebrand": source.get('vehiclebrand', ''),
-                                    "topic": source.get('topic', ''),
-                                    "symptoms": source.get('symptoms', ''),
-                                    "discussion": source.get('discussion', ''),
-                                    "solution": source.get('solution', ''),
-                                    "egon": source.get('egon', ''),
-                                    "spare1": source.get('spare1', ''),
-                                    "spare2": source.get('spare2', ''),
-                                    "spare4": source.get('spare4', ''),
-                                    "spare15": source.get('spare15', ''),
-                                    "faultcode": source.get('faultcode', ''),
-                                    "createtime": source.get('createtime', ''),
-                                    "money": source.get('money', ''),
-                                    "popularity": source.get('popularity', 0),
-                                    "searchNum": source.get('searchNum', 0),
-                                    "rate": source.get('rate'),
-                                    "highlight": hit.get('highlight', {}),
+                                    **fields,
+                                    "highlight": hit.get('highlight', {}) or {},
                                     "sources": [],
                                     "bm25_raw": 0.0,
                                     "semantic_raw": 0.0,
@@ -334,10 +562,12 @@ class OpenSearchMatcher:
                         semantic_stats,
                         fallback=clamp((semantic_raw + 1.0) / 2.0),
                     )
-                popularity = item.get('popularity', 0) or 0
-                popularity_norm = clamp(math.log1p(max(0.0, float(popularity))) / 5.0)
-                search_num = item.get('searchNum', 0) or 0
-                search_norm = clamp(float(search_num) / 50.0)
+                popularity_val = _coerce_float(item.get('popularity', 0))
+                item['popularity'] = popularity_val
+                popularity_norm = clamp(math.log1p(max(0.0, popularity_val)) / 5.0)
+                search_num_val = max(0, _coerce_int(item.get('searchNum', 0)))
+                item['searchNum'] = search_num_val
+                search_norm = clamp(float(search_num_val) / 50.0)
 
                 fusion_base = semantic_weight * semantic_norm + (1.0 - semantic_weight) * bm25_norm
                 final_score = min(1.0, fusion_base + 0.05 * popularity_norm + 0.05 * search_norm)
@@ -353,9 +583,9 @@ class OpenSearchMatcher:
                     why.append("系统一致")
                 if part and item.get('part') and part in item.get('part'):
                     why.append("部件相近")
-                if popularity > 100:
+                if popularity_val > 100:
                     why.append("热门案例")
-                elif popularity > 50:
+                elif popularity_val > 50:
                     why.append("常见问题")
 
                 item['final_score'] = final_score
@@ -417,27 +647,32 @@ class OpenSearchMatcher:
             should_clauses: List[Dict[str, Any]] = []
 
             if vehicle_brand:
-                must_clauses.append({"match": {"vehiclebrand": vehicle_brand}})
-
-            if vehicle_name:
                 must_clauses.append({
                     "multi_match": {
-                        "query": vehicle_name,
+                        "query": vehicle_brand,
                         "fields": [
-                            "vehicletype^2.0",
-                            "topic^1.5",
-                            "symptoms",
-                            "searchContent",
-                            "search_content",
+                            "vehiclebrand^2.0",
+                            "vehicle_brand^2.0",
+                            "brand^1.8",
                         ],
                         "type": "best_fields",
                     }
                 })
 
+            if vehicle_name:
+                must_clauses.append({
+                    "multi_match": {
+                        "query": vehicle_name,
+                        "fields": VEHICLE_NAME_FIELDS,
+                        "type": "best_fields",
+                    }
+                })
+
             if model_year:
-                year_should = []
-                for field in ["modelyear", "spare1", "spare15", "year", "vehicletype"]:
-                    year_should.append({"match_phrase": {field: model_year}})
+                year_should = [
+                    {"match_phrase": {field: model_year}}
+                    for field in MODEL_YEAR_FIELDS
+                ]
                 must_clauses.append({
                     "bool": {
                         "should": year_should,
@@ -449,13 +684,7 @@ class OpenSearchMatcher:
                 must_clauses.append({
                     "multi_match": {
                         "query": control_unit,
-                        "fields": [
-                            "part^2.0",
-                            "system^1.5",
-                            "discussion^1.2",
-                            "spare2",
-                            "spare1",
-                        ],
+                        "fields": CONTROL_UNIT_FIELDS,
                         "type": "best_fields",
                     }
                 })
@@ -464,13 +693,7 @@ class OpenSearchMatcher:
                 must_clauses.append({
                     "multi_match": {
                         "query": symptom,
-                        "fields": [
-                            "discussion^3.0",
-                            "symptoms^2.5",
-                            "text^2.0",
-                            "topic^1.5",
-                            "solution",
-                        ],
+                        "fields": FAULT_POINT_TEXT_FIELDS,
                         "type": "best_fields",
                         "fuzziness": "AUTO",
                         "minimum_should_match": "70%",
@@ -478,10 +701,10 @@ class OpenSearchMatcher:
                 })
 
             if fault_code:
-                should_clauses.extend([
-                    {"match_phrase": {"faultcode": fault_code}},
-                    {"match_phrase": {"spare4": fault_code}},
-                ])
+                should_clauses.extend(
+                    {"match_phrase": {field: fault_code}}
+                    for field in FAULT_CODE_FIELDS
+                )
 
             if not must_clauses:
                 must_clauses.append({"match_all": {}})
@@ -503,18 +726,41 @@ class OpenSearchMatcher:
                             "number_of_fragments": 1,
                             "pre_tags": ["<mark>"],
                             "post_tags": ["</mark>"],
+                        },
+                        "fault_point": {
+                            "fragment_size": 150,
+                            "number_of_fragments": 1,
+                            "pre_tags": ["<mark>"],
+                            "post_tags": ["</mark>"],
                         }
                     }
                 },
                 "_source": [
                     "discussion",
+                    "fault_point",
                     "vehiclebrand",
+                    "vehicle_brand",
                     "vehicletype",
+                    "vehicle_model",
                     "modelyear",
+                    "model_year",
+                    "brand",
                     "system",
+                    "system_name",
                     "part",
+                    "component",
+                    "component_name",
+                    "control_unit",
                     "faultcode",
+                    "fault_code",
                     "spare4",
+                    "dtc",
+                    "searchNum",
+                    "search_num",
+                    "popularity",
+                    "popularity_score",
+                    "tags",
+                    "labels",
                 ],
             }
 
@@ -527,18 +773,26 @@ class OpenSearchMatcher:
             fault_points: List[Dict[str, Any]] = []
             for hit in response.get('hits', {}).get('hits', []):
                 doc_id, source = self._extract_source(hit)
-                highlight = hit.get('highlight', {}).get('discussion') or []
+                fields = _extract_common_fields(source)
+                highlight_dict = hit.get('highlight', {}) or {}
+                highlight_text = _select_highlight(
+                    highlight_dict,
+                    ["fault_point", "discussion"],
+                )
                 fault_points.append({
                     "id": doc_id,
                     "score": float(hit.get('_score') or 0.0),
-                    "discussion": source.get('discussion', ''),
-                    "highlight": highlight[0] if highlight else None,
-                    "vehiclebrand": source.get('vehiclebrand'),
-                    "vehicletype": source.get('vehicletype'),
-                    "modelyear": source.get('modelyear') or source.get('spare1'),
-                    "system": source.get('system'),
-                    "part": source.get('part'),
-                    "faultcode": source.get('faultcode') or source.get('spare4'),
+                    "discussion": fields.get('discussion', ''),
+                    "highlight": highlight_text,
+                    "vehiclebrand": fields.get('vehiclebrand'),
+                    "vehicletype": fields.get('vehicletype'),
+                    "modelyear": fields.get('modelyear'),
+                    "system": fields.get('system'),
+                    "part": fields.get('part'),
+                    "faultcode": fields.get('faultcode') or fields.get('spare4'),
+                    "popularity": fields.get('popularity'),
+                    "searchNum": fields.get('searchNum'),
+                    "tags": fields.get('tags'),
                 })
 
             return {

@@ -19,7 +19,7 @@ OPENSEARCH_CONFIG = {
 
 # 索引配置
 INDEX_CONFIG = {
-    'name': 'automotive_cases',  # 索引名称
+    'name': 'cases_recovery',  # 索引名称
     'shards': 1,  # 分片数
     'replicas': 0,  # 副本数
     # 语义检索相关配置
