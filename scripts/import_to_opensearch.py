@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib
 import importlib.util
 import json
@@ -225,6 +226,7 @@ class OpenSearchImporter:
         vector_dimension: int = 512,
         embedding_model: Optional[str] = None,
         model_cache_dir: Optional[str] = None,
+        clone_source_index: Optional[str] = "automotive_cases",
     ) -> None:
         """初始化 OpenSearch 连接并准备向量写入。"""
 
@@ -298,6 +300,9 @@ class OpenSearchImporter:
         self.vector_dimension = vector_dimension
         self.embedding_model = embedding_model.strip() if embedding_model else None
         self.model_cache_dir = model_cache_dir.strip() if model_cache_dir else None
+        self.clone_source_index = (
+            clone_source_index.strip() if clone_source_index else None
+        )
         self.embedder: Optional[Any] = None
         self._prepared_model_path: Optional[str] = None
 
@@ -484,35 +489,53 @@ class OpenSearchImporter:
             "solution": solution[:300] if solution else "",
         }
 
+    def _should_replace_field(self, current: Any) -> bool:
+        if current is None:
+            return True
+        if isinstance(current, str):
+            return not current.strip()
+        if isinstance(current, (list, tuple, set)):
+            return len(current) == 0
+        return False
+
     def transform_record(self, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         source = record.get("_source") or {}
+        transformed: Dict[str, Any] = copy.deepcopy(source)
+
+        doc_id = record.get("_id") or transformed.get("id")
+        if not doc_id:
+            logger.debug("记录缺少 id，已跳过: %s", record)
+            return None
+
+        transformed.setdefault("id", doc_id)
+        transformed.setdefault("source_index", record.get("_index"))
+        transformed.setdefault("source_type", record.get("_type"))
+
         search_content = source.get("search", "")
         extracted = self.extract_symptoms_and_solution(search_content)
 
-        transformed: Dict[str, Any] = {
-            "id": record.get("_id", ""),
-            "vehicletype": source.get("vehicletype", ""),
-            "discussion": source.get("discussion", ""),
-            "symptoms": extracted.get("symptoms", ""),
-            "solution": extracted.get("solution", ""),
-            "search_content": self.clean_html_content(search_content)[:2000],
-            "search_num": source.get("searchNum", 0),
-            "rate": source.get("rate"),
-            "vin": source.get("vin"),
-            "created_at": datetime.now().isoformat(),
-            "source_index": record.get("_index", ""),
-            "source_type": record.get("_type", ""),
-        }
+        if self._should_replace_field(transformed.get("symptoms")):
+            symptoms = extracted.get("symptoms")
+            if symptoms:
+                transformed["symptoms"] = symptoms
 
-        transformed = {
-            key: value
-            for key, value in transformed.items()
-            if value not in (None, "")
-        }
+        if self._should_replace_field(transformed.get("solution")):
+            solution = extracted.get("solution")
+            if solution:
+                transformed["solution"] = solution
 
-        if not transformed.get("id"):
-            logger.debug("记录缺少 id，已跳过: %s", record)
-            return None
+        cleaned_search = self.clean_html_content(search_content)[:2000]
+        if cleaned_search and self._should_replace_field(transformed.get("search_content")):
+            transformed["search_content"] = cleaned_search
+
+        if self._should_replace_field(transformed.get("import_time")):
+            transformed["import_time"] = datetime.now().isoformat()
+
+        if (
+            self._should_replace_field(transformed.get("search_num"))
+            and "searchNum" in source
+        ):
+            transformed["search_num"] = source.get("searchNum")
 
         if self.enable_vector and self.embedder is not None:
             text_for_vector = (
@@ -579,6 +602,42 @@ class OpenSearchImporter:
     # ------------------------------------------------------------------
     # 索引管理 & 导入流程
     # ------------------------------------------------------------------
+    def _fetch_source_mapping(self, source_index: str) -> Optional[Dict[str, Any]]:
+        try:
+            response = self.client.indices.get_mapping(index=source_index)
+        except Exception as exc:
+            logger.warning("无法读取源索引 %s 的映射: %s", source_index, exc)
+            return None
+
+        mapping = response.get(source_index, {}).get("mappings")
+        if not mapping:
+            return None
+
+        return copy.deepcopy(mapping)
+
+    def _build_default_mapping(self) -> Dict[str, Any]:
+        return {
+            "mappings": {
+                "properties": {
+                    "id": {"type": "keyword"},
+                    "vehicletype": {
+                        "type": "text",
+                        "fields": {"keyword": {"type": "keyword"}},
+                    },
+                    "discussion": {"type": "text"},
+                    "symptoms": {"type": "text"},
+                    "solution": {"type": "text"},
+                    "search_content": {"type": "text"},
+                    "search_num": {"type": "integer"},
+                    "rate": {"type": "float"},
+                    "vin": {"type": "keyword"},
+                    "created_at": {"type": "date"},
+                    "source_index": {"type": "keyword"},
+                    "source_type": {"type": "keyword"},
+                }
+            }
+        }
+
     def create_index_mapping(self, index_name: str) -> bool:
         try:
             if self.client.indices.exists(index=index_name):
@@ -587,43 +646,49 @@ class OpenSearchImporter:
                     self._ensure_vector_compat(index_name)
                 return True
 
-            body: Dict[str, Any] = {
-                "mappings": {
-                    "properties": {
-                        "id": {"type": "keyword"},
-                        "vehicletype": {
-                            "type": "text",
-                            "fields": {"keyword": {"type": "keyword"}},
-                        },
-                        "discussion": {"type": "text"},
-                        "symptoms": {"type": "text"},
-                        "solution": {"type": "text"},
-                        "search_content": {"type": "text"},
-                        "search_num": {"type": "integer"},
-                        "rate": {"type": "float"},
-                        "vin": {"type": "keyword"},
-                        "created_at": {"type": "date"},
-                        "source_index": {"type": "keyword"},
-                        "source_type": {"type": "keyword"},
-                    }
-                }
-            }
+            body: Dict[str, Any]
+            cloned = False
+
+            if (
+                self.clone_source_index
+                and self.clone_source_index != index_name
+            ):
+                mapping = self._fetch_source_mapping(self.clone_source_index)
+                if mapping:
+                    body = {"mappings": mapping}
+                    cloned = True
+                    logger.info(
+                        "已从索引 %s 克隆映射", self.clone_source_index
+                    )
+                else:
+                    logger.warning(
+                        "未能从索引 %s 克隆映射，将使用默认映射", self.clone_source_index
+                    )
+
+            if not cloned:
+                body = self._build_default_mapping()
 
             if self.enable_vector:
                 body.setdefault("settings", {})["index.knn"] = True
-                body["mappings"]["properties"][self.vector_field] = {
-                    "type": "knn_vector",
-                    "dimension": self.vector_dimension,
-                    "method": {
-                        "name": "hnsw",
-                        "space_type": "cosinesimil",
-                        "engine": "nmslib",
-                        "parameters": {
-                            "ef_construction": 128,
-                            "m": 16,
+                properties = body.setdefault("mappings", {}).setdefault("properties", {})
+                if self.vector_field in properties:
+                    logger.info(
+                        "向量字段 %s 已存在于映射中，将沿用现有定义", self.vector_field
+                    )
+                else:
+                    properties[self.vector_field] = {
+                        "type": "knn_vector",
+                        "dimension": self.vector_dimension,
+                        "method": {
+                            "name": "hnsw",
+                            "space_type": "cosinesimil",
+                            "engine": "nmslib",
+                            "parameters": {
+                                "ef_construction": 128,
+                                "m": 16,
+                            },
                         },
-                    },
-                }
+                    }
 
             self.client.indices.create(index=index_name, body=body)
             logger.info("成功创建索引: %s", index_name)
@@ -811,6 +876,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--vector-dim", type=int, default=512, help="向量维度")
     parser.add_argument("--embedding-model", help="SentenceTransformer 模型 ID")
     parser.add_argument("--model-cache", help="embedding 模型缓存目录")
+    parser.add_argument(
+        "--clone-mapping-from",
+        default="automotive_cases",
+        help="从指定索引克隆映射，保留所有原字段",
+    )
 
     parser.add_argument("--test", action="store_true", help="导入完成后执行一次示例查询")
     return parser.parse_args(argv)
@@ -833,6 +903,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             vector_dimension=args.vector_dim,
             embedding_model=args.embedding_model,
             model_cache_dir=args.model_cache,
+            clone_source_index=args.clone_mapping_from,
         )
     except ValueError:
         return 1
