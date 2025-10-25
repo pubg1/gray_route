@@ -442,8 +442,9 @@ class OpenSearchMatcher:
                 },
                 "sort": [
                     {"_score": {"order": "desc"}},
-                    {"popularity": {"order": "desc"}},
-                    {"searchNum": {"order": "desc"}}
+                    {"popularity": {"order": "desc", "missing": "_last", "unmapped_type": "float"}},
+                    {"search_num": {"order": "desc", "missing": "_last", "unmapped_type": "integer"}},
+                    {"searchNum": {"order": "desc", "missing": "_last", "unmapped_type": "integer"}}
                 ]
             }
 
