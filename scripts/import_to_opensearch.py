@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib
 import importlib.util
 import json
@@ -21,7 +22,8 @@ import os
 import re
 import sys
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 from opensearchpy import OpenSearch
 from opensearchpy.helpers import bulk
@@ -83,6 +85,169 @@ logger = logging.getLogger(__name__)
 
 
 class OpenSearchImporter:
+    @staticmethod
+    def _coerce_bool(name: str, value: Any, *, default: bool = False) -> bool:
+        """Normalize truthy configuration flags coming from shell/environment values."""
+
+        if isinstance(value, bool):
+            return value
+
+        if value is None:
+            return default
+
+        if isinstance(value, (int, float)):
+            if value in (0, 1):
+                return bool(value)
+            raise ValueError(
+                f"OpenSearch {name} 配置无效: 仅支持 0/1 或布尔值"
+            )
+
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if not normalized:
+                return default
+            if normalized in {"true", "1", "yes", "y", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "n", "off"}:
+                return False
+
+        raise ValueError(f"OpenSearch {name} 配置无效: {value!r}")
+
+    @classmethod
+    def _normalize_ssl_assert_hostname(cls, value: Any, host: str) -> Any:
+        """Sanitize the ``ssl_assert_hostname`` option for urllib3 compatibility."""
+
+        if value is None:
+            return host
+
+        if isinstance(value, bool):
+            return host if value else False
+
+        if isinstance(value, (int, float)):
+            if value in (0, 1):
+                return host if bool(value) else False
+            raise ValueError("OpenSearch ssl_assert_hostname 配置无效: 仅支持 0/1")
+
+        if isinstance(value, str):
+            normalized = value.strip()
+            if not normalized:
+                return host
+
+            lowered = normalized.lower()
+            if lowered in {"true", "1", "yes", "y", "on"}:
+                return host
+            if lowered in {"false", "0", "no", "n", "off"}:
+                return False
+
+            return normalized
+
+        raise ValueError(f"OpenSearch ssl_assert_hostname 配置无效: {value!r}")
+
+    @staticmethod
+    def _normalize_host(raw_host: Any) -> str:
+        """Ensure the OpenSearch host value is a non-empty hostname string."""
+
+        if isinstance(raw_host, bool):
+            raise ValueError(
+                "OpenSearch host 配置不能是布尔值，请检查 OPENSEARCH_HOST 或配置文件"
+            )
+
+        if raw_host is None:
+            return "localhost"
+
+        host_str = str(raw_host).strip()
+        if not host_str:
+            raise ValueError(
+                "OpenSearch host 配置为空，请在环境变量或 opensearch_config.py 中设置有效地址"
+            )
+
+        return host_str
+
+    @staticmethod
+    def _normalize_port(raw_port: Any) -> int:
+        """Validate the OpenSearch port value and convert it to ``int``."""
+
+        if isinstance(raw_port, bool) or raw_port is None:
+            raise ValueError("OpenSearch port 配置无效，请提供正确的端口号")
+
+        try:
+            port_int = int(raw_port)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("OpenSearch port 必须是整数") from exc
+
+        if port_int <= 0:
+            raise ValueError("OpenSearch port 必须是正整数")
+
+        return port_int
+
+    @classmethod
+    def _normalize_endpoint(
+        cls, raw_host: Any, raw_port: Any, use_ssl: Any
+    ) -> Tuple[str, int, bool, Optional[str]]:
+        """Parse host/port values and extract optional URL prefix information."""
+
+        host_value = cls._normalize_host(raw_host)
+        port_value = cls._normalize_port(raw_port)
+        ssl_flag = cls._coerce_bool("use_ssl", use_ssl)
+
+        # urlparse requires a scheme to reliably split host/port/path.
+        default_scheme = "https" if ssl_flag else "http"
+        parse_target = host_value if "://" in host_value else f"{default_scheme}://{host_value}"
+        parsed = urlparse(parse_target)
+
+        if not parsed.hostname:
+            raise ValueError("OpenSearch host 配置无法解析出有效的主机名")
+
+        host_value = parsed.hostname
+        if parsed.port:
+            port_value = parsed.port
+
+        # Any explicit scheme in the host should override the passed-in flag.
+        if parsed.scheme in {"http", "https"}:
+            ssl_flag = parsed.scheme == "https"
+
+        url_prefix = parsed.path.strip("/") if parsed.path and parsed.path != "/" else None
+
+        return host_value, port_value, ssl_flag, url_prefix
+
+    @staticmethod
+    def _parse_version(version: str) -> Tuple[int, int, int]:
+        parts = [int(part) for part in re.findall(r"\d+", version)[:3]]
+        while len(parts) < 3:
+            parts.append(0)
+        return parts[0], parts[1], parts[2]
+
+    @classmethod
+    def _select_knn_engine(cls, version: str) -> str:
+        try:
+            major, minor, _ = cls._parse_version(version)
+        except Exception:
+            return "nmslib"
+
+        if major >= 3:
+            return "lucene"
+        if major == 2 and minor >= 12:
+            return "lucene"
+        return "nmslib"
+
+    def _build_knn_field(self) -> Dict[str, Any]:
+        method: Dict[str, Any] = {
+            "name": "hnsw",
+            "space_type": "cosinesimil",
+            "engine": self.knn_engine,
+        }
+        if self.knn_engine == "nmslib":
+            method["parameters"] = {
+                "ef_construction": 128,
+                "m": 16,
+            }
+
+        return {
+            "type": "knn_vector",
+            "dimension": self.vector_dimension,
+            "method": method,
+        }
+
     def __init__(
         self,
         host: str = "localhost",
@@ -91,7 +256,7 @@ class OpenSearchImporter:
         password: Optional[str] = None,
         use_ssl: bool = False,
         verify_certs: bool = False,
-        ssl_assert_hostname: bool = True,
+        ssl_assert_hostname: Any = True,
         ssl_show_warn: bool = True,
         timeout: int = 30,
         enable_vector: bool = False,
@@ -99,23 +264,62 @@ class OpenSearchImporter:
         vector_dimension: int = 512,
         embedding_model: Optional[str] = None,
         model_cache_dir: Optional[str] = None,
+        clone_source_index: Optional[str] = "automotive_cases",
+        preserve_source_fields: bool = False,
+        recreate_index: bool = False,
     ) -> None:
         """初始化 OpenSearch 连接并准备向量写入。"""
 
-        if host.startswith("http://") or host.startswith("https://"):
-            host = host.replace("https://", "").replace("http://", "")
+        try:
+            use_ssl_flag = self._coerce_bool("use_ssl", use_ssl)
+            verify_certs_flag = self._coerce_bool("verify_certs", verify_certs)
+            ssl_show_warn_flag = self._coerce_bool(
+                "ssl_show_warn", ssl_show_warn, default=True
+            )
+        except ValueError as exc:
+            logger.error("无效的 OpenSearch 连接配置: %s", exc)
+            raise
+
+        self.knn_engine = "nmslib"
+
+        try:
+            host_value, port_value, use_ssl_flag, url_prefix = self._normalize_endpoint(
+                host, port, use_ssl_flag
+            )
+        except ValueError as exc:
+            logger.error("无效的 OpenSearch 连接配置: %s", exc)
+            raise
+
+        try:
+            ssl_assert_hostname_value = self._normalize_ssl_assert_hostname(
+                ssl_assert_hostname, host_value
+            )
+        except ValueError as exc:
+            logger.error("无效的 OpenSearch 连接配置: %s", exc)
+            raise
+
+        if not verify_certs_flag:
+            ssl_assert_hostname_value = None
+
+        if isinstance(ssl_assert_hostname_value, bool):
+            ssl_assert_hostname_value = host_value if ssl_assert_hostname_value else None
 
         self.config = {
-            "hosts": [{"host": host, "port": port}],
+            "hosts": [{"host": host_value, "port": port_value}],
             "http_compress": True,
-            "use_ssl": use_ssl,
-            "verify_certs": verify_certs,
-            "ssl_assert_hostname": ssl_assert_hostname,
-            "ssl_show_warn": ssl_show_warn,
+            "use_ssl": use_ssl_flag,
+            "verify_certs": verify_certs_flag,
+            "ssl_show_warn": ssl_show_warn_flag,
             "timeout": timeout,
             "max_retries": 3,
             "retry_on_timeout": True,
         }
+
+        if ssl_assert_hostname_value is not None:
+            self.config["ssl_assert_hostname"] = ssl_assert_hostname_value
+
+        if url_prefix:
+            self.config["url_prefix"] = url_prefix
 
         if username and password:
             self.config["http_auth"] = (username, password)
@@ -124,9 +328,20 @@ class OpenSearchImporter:
             self.client = OpenSearch(**self.config)
             info = self.client.info()
             self.server_version = info.get("version", {}).get("number", "unknown")
+            self.knn_engine = self._select_knn_engine(self.server_version)
             logger.info("成功连接到 OpenSearch: %s", self.server_version)
+            logger.info("kNN 向量引擎: %s", self.knn_engine)
         except Exception as exc:  # pragma: no cover - 连接失败时直接抛出
             logger.error("连接 OpenSearch 失败: %s", exc)
+            raise
+
+        try:
+            preserve_flag = self._coerce_bool(
+                "preserve_source_fields", preserve_source_fields
+            )
+            recreate_flag = self._coerce_bool("recreate_index", recreate_index)
+        except ValueError as exc:
+            logger.error("无效的 OpenSearch 连接配置: %s", exc)
             raise
 
         self.enable_vector = bool(enable_vector)
@@ -134,6 +349,14 @@ class OpenSearchImporter:
         self.vector_dimension = vector_dimension
         self.embedding_model = embedding_model.strip() if embedding_model else None
         self.model_cache_dir = model_cache_dir.strip() if model_cache_dir else None
+        clone_target = clone_source_index
+        if clone_target is None and not preserve_flag:
+            clone_target = "automotive_cases"
+        if isinstance(clone_target, str):
+            clone_target = clone_target.strip()
+        self.clone_source_index = clone_target or None
+        self.preserve_source_fields = preserve_flag
+        self.recreate_index = recreate_flag
         self.embedder: Optional[Any] = None
         self._prepared_model_path: Optional[str] = None
 
@@ -320,35 +543,82 @@ class OpenSearchImporter:
             "solution": solution[:300] if solution else "",
         }
 
+    def _should_replace_field(self, current: Any) -> bool:
+        if current is None:
+            return True
+        if isinstance(current, str):
+            return not current.strip()
+        if isinstance(current, (list, tuple, set)):
+            return len(current) == 0
+        return False
+
     def transform_record(self, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         source = record.get("_source") or {}
+        transformed: Dict[str, Any] = copy.deepcopy(source)
+
+        doc_id = record.get("_id") or transformed.get("id")
+        if not doc_id:
+            logger.debug("记录缺少 id，已跳过: %s", record)
+            return None
+
+        if self.preserve_source_fields:
+            if (
+                "id" not in transformed
+                or self._should_replace_field(transformed.get("id"))
+            ):
+                transformed["id"] = doc_id
+
+            if (
+                self.enable_vector
+                and self.embedder is not None
+                and self.vector_field
+                and (
+                    self.vector_field not in transformed
+                    or self._should_replace_field(transformed.get(self.vector_field))
+                )
+            ):
+                text_for_vector = (
+                    transformed.get("search_content")
+                    or transformed.get("search")
+                    or transformed.get("discussion")
+                    or transformed.get("symptoms")
+                    or ""
+                )
+                vector = self._build_vector(text_for_vector)
+                if vector is not None:
+                    transformed[self.vector_field] = vector
+
+            return transformed
+
+        transformed.setdefault("id", doc_id)
+        transformed.setdefault("source_index", record.get("_index"))
+        transformed.setdefault("source_type", record.get("_type"))
+
         search_content = source.get("search", "")
         extracted = self.extract_symptoms_and_solution(search_content)
 
-        transformed: Dict[str, Any] = {
-            "id": record.get("_id", ""),
-            "vehicletype": source.get("vehicletype", ""),
-            "discussion": source.get("discussion", ""),
-            "symptoms": extracted.get("symptoms", ""),
-            "solution": extracted.get("solution", ""),
-            "search_content": self.clean_html_content(search_content)[:2000],
-            "search_num": source.get("searchNum", 0),
-            "rate": source.get("rate"),
-            "vin": source.get("vin"),
-            "created_at": datetime.now().isoformat(),
-            "source_index": record.get("_index", ""),
-            "source_type": record.get("_type", ""),
-        }
+        if self._should_replace_field(transformed.get("symptoms")):
+            symptoms = extracted.get("symptoms")
+            if symptoms:
+                transformed["symptoms"] = symptoms
 
-        transformed = {
-            key: value
-            for key, value in transformed.items()
-            if value not in (None, "")
-        }
+        if self._should_replace_field(transformed.get("solution")):
+            solution = extracted.get("solution")
+            if solution:
+                transformed["solution"] = solution
 
-        if not transformed.get("id"):
-            logger.debug("记录缺少 id，已跳过: %s", record)
-            return None
+        cleaned_search = self.clean_html_content(search_content)[:2000]
+        if cleaned_search and self._should_replace_field(transformed.get("search_content")):
+            transformed["search_content"] = cleaned_search
+
+        if self._should_replace_field(transformed.get("import_time")):
+            transformed["import_time"] = datetime.now().isoformat()
+
+        if (
+            self._should_replace_field(transformed.get("search_num"))
+            and "searchNum" in source
+        ):
+            transformed["search_num"] = source.get("searchNum")
 
         if self.enable_vector and self.embedder is not None:
             text_for_vector = (
@@ -415,51 +685,102 @@ class OpenSearchImporter:
     # ------------------------------------------------------------------
     # 索引管理 & 导入流程
     # ------------------------------------------------------------------
+    def _fetch_source_mapping(self, source_index: str) -> Optional[Dict[str, Any]]:
+        try:
+            response = self.client.indices.get_mapping(index=source_index)
+        except Exception as exc:
+            logger.warning("无法读取源索引 %s 的映射: %s", source_index, exc)
+            return None
+
+        mapping = response.get(source_index, {}).get("mappings")
+        if not mapping:
+            return None
+
+        return copy.deepcopy(mapping)
+
+    def _build_default_mapping(self) -> Dict[str, Any]:
+        return {
+            "mappings": {
+                "properties": {
+                    "id": {"type": "keyword"},
+                    "vehicletype": {
+                        "type": "text",
+                        "fields": {"keyword": {"type": "keyword"}},
+                    },
+                    "discussion": {"type": "text"},
+                    "symptoms": {"type": "text"},
+                    "solution": {"type": "text"},
+                    "search_content": {"type": "text"},
+                    "search_num": {"type": "integer"},
+                    "rate": {"type": "float"},
+                    "vin": {"type": "keyword"},
+                    "created_at": {"type": "date"},
+                    "source_index": {"type": "keyword"},
+                    "source_type": {"type": "keyword"},
+                }
+            }
+        }
+
+    def _build_preserve_mapping(self) -> Dict[str, Any]:
+        return {
+            "mappings": {
+                "dynamic": True,
+                "properties": {
+                    "id": {"type": "keyword"},
+                },
+            }
+        }
+
     def create_index_mapping(self, index_name: str) -> bool:
         try:
             if self.client.indices.exists(index=index_name):
-                logger.info("索引 %s 已存在", index_name)
-                if self.enable_vector:
-                    self._ensure_vector_compat(index_name)
-                return True
+                if self.recreate_index:
+                    try:
+                        logger.info("索引 %s 已存在，将删除后重新创建", index_name)
+                        self.client.indices.delete(index=index_name)
+                    except Exception as exc:
+                        logger.error("删除已存在索引失败: %s", exc)
+                        return False
+                else:
+                    logger.info("索引 %s 已存在", index_name)
+                    if self.enable_vector:
+                        self._ensure_vector_compat(index_name)
+                    return True
 
-            body: Dict[str, Any] = {
-                "mappings": {
-                    "properties": {
-                        "id": {"type": "keyword"},
-                        "vehicletype": {
-                            "type": "text",
-                            "fields": {"keyword": {"type": "keyword"}},
-                        },
-                        "discussion": {"type": "text"},
-                        "symptoms": {"type": "text"},
-                        "solution": {"type": "text"},
-                        "search_content": {"type": "text"},
-                        "search_num": {"type": "integer"},
-                        "rate": {"type": "float"},
-                        "vin": {"type": "keyword"},
-                        "created_at": {"type": "date"},
-                        "source_index": {"type": "keyword"},
-                        "source_type": {"type": "keyword"},
-                    }
-                }
-            }
+            body: Dict[str, Any]
+            cloned = False
+
+            if (
+                self.clone_source_index
+                and self.clone_source_index != index_name
+            ):
+                mapping = self._fetch_source_mapping(self.clone_source_index)
+                if mapping:
+                    body = {"mappings": mapping}
+                    cloned = True
+                    logger.info(
+                        "已从索引 %s 克隆映射", self.clone_source_index
+                    )
+                else:
+                    logger.warning(
+                        "未能从索引 %s 克隆映射，将使用默认映射", self.clone_source_index
+                    )
+
+            if not cloned:
+                if self.preserve_source_fields:
+                    body = self._build_preserve_mapping()
+                else:
+                    body = self._build_default_mapping()
 
             if self.enable_vector:
                 body.setdefault("settings", {})["index.knn"] = True
-                body["mappings"]["properties"][self.vector_field] = {
-                    "type": "knn_vector",
-                    "dimension": self.vector_dimension,
-                    "method": {
-                        "name": "hnsw",
-                        "space_type": "cosinesimil",
-                        "engine": "nmslib",
-                        "parameters": {
-                            "ef_construction": 128,
-                            "m": 16,
-                        },
-                    },
-                }
+                properties = body.setdefault("mappings", {}).setdefault("properties", {})
+                if self.vector_field in properties:
+                    logger.info(
+                        "向量字段 %s 已存在于映射中，将沿用现有定义", self.vector_field
+                    )
+                else:
+                    properties[self.vector_field] = self._build_knn_field()
 
             self.client.indices.create(index=index_name, body=body)
             logger.info("成功创建索引: %s", index_name)
@@ -482,19 +803,7 @@ class OpenSearchImporter:
             try:
                 body = {
                     "properties": {
-                        self.vector_field: {
-                            "type": "knn_vector",
-                            "dimension": self.vector_dimension,
-                            "method": {
-                                "name": "hnsw",
-                                "space_type": "cosinesimil",
-                                "engine": "nmslib",
-                                "parameters": {
-                                    "ef_construction": 128,
-                                    "m": 16,
-                                },
-                            },
-                        }
+                        self.vector_field: self._build_knn_field()
                     }
                 }
                 self.client.indices.put_mapping(index=index_name, body=body)
@@ -517,6 +826,17 @@ class OpenSearchImporter:
                     dimension,
                 )
                 self.vector_dimension = int(dimension)
+
+            existing_engine = (
+                vector_mapping.get("method", {}).get("engine")
+            )
+            if existing_engine and existing_engine != self.knn_engine:
+                logger.info(
+                    "索引 %s 的向量字段使用引擎 %s，与当前配置 %s 不一致，保留现有设置",
+                    index_name,
+                    existing_engine,
+                    self.knn_engine,
+                )
 
         try:
             settings = self.client.indices.get_settings(index=index_name)
@@ -647,6 +967,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--vector-dim", type=int, default=512, help="向量维度")
     parser.add_argument("--embedding-model", help="SentenceTransformer 模型 ID")
     parser.add_argument("--model-cache", help="embedding 模型缓存目录")
+    parser.add_argument(
+        "--clone-mapping-from",
+        default=None,
+        help="从指定索引克隆映射，保留所有原字段 (留空表示不克隆)",
+    )
+    parser.add_argument(
+        "--preserve-source-fields",
+        action="store_true",
+        help="保持原始 _source 字段不做额外填充，仅追加向量字段",
+    )
+    parser.add_argument(
+        "--recreate-index",
+        action="store_true",
+        help="若索引已存在则删除后重新创建",
+    )
 
     parser.add_argument("--test", action="store_true", help="导入完成后执行一次示例查询")
     return parser.parse_args(argv)
@@ -655,20 +990,26 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
 
-    importer = OpenSearchImporter(
-        host=args.host,
-        port=args.port,
-        username=args.username,
-        password=args.password,
-        use_ssl=args.ssl,
-        verify_certs=args.verify_certs,
-        timeout=args.timeout,
-        enable_vector=args.enable_vector,
-        vector_field=args.vector_field,
-        vector_dimension=args.vector_dim,
-        embedding_model=args.embedding_model,
-        model_cache_dir=args.model_cache,
-    )
+    try:
+        importer = OpenSearchImporter(
+            host=args.host,
+            port=args.port,
+            username=args.username,
+            password=args.password,
+            use_ssl=args.ssl,
+            verify_certs=args.verify_certs,
+            timeout=args.timeout,
+            enable_vector=args.enable_vector,
+            vector_field=args.vector_field,
+            vector_dimension=args.vector_dim,
+            embedding_model=args.embedding_model,
+            model_cache_dir=args.model_cache,
+            clone_source_index=args.clone_mapping_from,
+            preserve_source_fields=args.preserve_source_fields,
+            recreate_index=args.recreate_index,
+        )
+    except ValueError:
+        return 1
 
     success = importer.import_data(args.file, args.index, batch_size=args.batch_size)
 
