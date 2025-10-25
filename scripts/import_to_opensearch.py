@@ -21,7 +21,8 @@ import os
 import re
 import sys
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 from opensearchpy import OpenSearch
 from opensearchpy.helpers import bulk
@@ -83,6 +84,131 @@ logger = logging.getLogger(__name__)
 
 
 class OpenSearchImporter:
+    @staticmethod
+    def _coerce_bool(name: str, value: Any, *, default: bool = False) -> bool:
+        """Normalize truthy configuration flags coming from shell/environment values."""
+
+        if isinstance(value, bool):
+            return value
+
+        if value is None:
+            return default
+
+        if isinstance(value, (int, float)):
+            if value in (0, 1):
+                return bool(value)
+            raise ValueError(
+                f"OpenSearch {name} 配置无效: 仅支持 0/1 或布尔值"
+            )
+
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if not normalized:
+                return default
+            if normalized in {"true", "1", "yes", "y", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "n", "off"}:
+                return False
+
+        raise ValueError(f"OpenSearch {name} 配置无效: {value!r}")
+
+    @classmethod
+    def _normalize_ssl_assert_hostname(cls, value: Any, host: str) -> Any:
+        """Sanitize the ``ssl_assert_hostname`` option for urllib3 compatibility."""
+
+        if value is None:
+            return host
+
+        if isinstance(value, bool):
+            return host if value else False
+
+        if isinstance(value, (int, float)):
+            if value in (0, 1):
+                return host if bool(value) else False
+            raise ValueError("OpenSearch ssl_assert_hostname 配置无效: 仅支持 0/1")
+
+        if isinstance(value, str):
+            normalized = value.strip()
+            if not normalized:
+                return host
+
+            lowered = normalized.lower()
+            if lowered in {"true", "1", "yes", "y", "on"}:
+                return host
+            if lowered in {"false", "0", "no", "n", "off"}:
+                return False
+
+            return normalized
+
+        raise ValueError(f"OpenSearch ssl_assert_hostname 配置无效: {value!r}")
+
+    @staticmethod
+    def _normalize_host(raw_host: Any) -> str:
+        """Ensure the OpenSearch host value is a non-empty hostname string."""
+
+        if isinstance(raw_host, bool):
+            raise ValueError(
+                "OpenSearch host 配置不能是布尔值，请检查 OPENSEARCH_HOST 或配置文件"
+            )
+
+        if raw_host is None:
+            return "localhost"
+
+        host_str = str(raw_host).strip()
+        if not host_str:
+            raise ValueError(
+                "OpenSearch host 配置为空，请在环境变量或 opensearch_config.py 中设置有效地址"
+            )
+
+        return host_str
+
+    @staticmethod
+    def _normalize_port(raw_port: Any) -> int:
+        """Validate the OpenSearch port value and convert it to ``int``."""
+
+        if isinstance(raw_port, bool) or raw_port is None:
+            raise ValueError("OpenSearch port 配置无效，请提供正确的端口号")
+
+        try:
+            port_int = int(raw_port)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("OpenSearch port 必须是整数") from exc
+
+        if port_int <= 0:
+            raise ValueError("OpenSearch port 必须是正整数")
+
+        return port_int
+
+    @classmethod
+    def _normalize_endpoint(
+        cls, raw_host: Any, raw_port: Any, use_ssl: Any
+    ) -> Tuple[str, int, bool, Optional[str]]:
+        """Parse host/port values and extract optional URL prefix information."""
+
+        host_value = cls._normalize_host(raw_host)
+        port_value = cls._normalize_port(raw_port)
+        ssl_flag = cls._coerce_bool("use_ssl", use_ssl)
+
+        # urlparse requires a scheme to reliably split host/port/path.
+        default_scheme = "https" if ssl_flag else "http"
+        parse_target = host_value if "://" in host_value else f"{default_scheme}://{host_value}"
+        parsed = urlparse(parse_target)
+
+        if not parsed.hostname:
+            raise ValueError("OpenSearch host 配置无法解析出有效的主机名")
+
+        host_value = parsed.hostname
+        if parsed.port:
+            port_value = parsed.port
+
+        # Any explicit scheme in the host should override the passed-in flag.
+        if parsed.scheme in {"http", "https"}:
+            ssl_flag = parsed.scheme == "https"
+
+        url_prefix = parsed.path.strip("/") if parsed.path and parsed.path != "/" else None
+
+        return host_value, port_value, ssl_flag, url_prefix
+
     def __init__(
         self,
         host: str = "localhost",
@@ -91,7 +217,7 @@ class OpenSearchImporter:
         password: Optional[str] = None,
         use_ssl: bool = False,
         verify_certs: bool = False,
-        ssl_assert_hostname: bool = True,
+        ssl_assert_hostname: Any = True,
         ssl_show_warn: bool = True,
         timeout: int = 30,
         enable_vector: bool = False,
@@ -102,20 +228,51 @@ class OpenSearchImporter:
     ) -> None:
         """初始化 OpenSearch 连接并准备向量写入。"""
 
-        if host.startswith("http://") or host.startswith("https://"):
-            host = host.replace("https://", "").replace("http://", "")
+        try:
+            use_ssl_flag = self._coerce_bool("use_ssl", use_ssl)
+            verify_certs_flag = self._coerce_bool("verify_certs", verify_certs)
+            ssl_show_warn_flag = self._coerce_bool(
+                "ssl_show_warn", ssl_show_warn, default=True
+            )
+        except ValueError as exc:
+            logger.error("无效的 OpenSearch 连接配置: %s", exc)
+            raise
+
+        try:
+            host_value, port_value, use_ssl_flag, url_prefix = self._normalize_endpoint(
+                host, port, use_ssl_flag
+            )
+        except ValueError as exc:
+            logger.error("无效的 OpenSearch 连接配置: %s", exc)
+            raise
+
+        try:
+            ssl_assert_hostname_value = self._normalize_ssl_assert_hostname(
+                ssl_assert_hostname, host_value
+            )
+        except ValueError as exc:
+            logger.error("无效的 OpenSearch 连接配置: %s", exc)
+            raise
+
+        if not verify_certs_flag:
+            ssl_assert_hostname_value = False
 
         self.config = {
-            "hosts": [{"host": host, "port": port}],
+            "hosts": [{"host": host_value, "port": port_value}],
             "http_compress": True,
-            "use_ssl": use_ssl,
-            "verify_certs": verify_certs,
-            "ssl_assert_hostname": ssl_assert_hostname,
-            "ssl_show_warn": ssl_show_warn,
+            "use_ssl": use_ssl_flag,
+            "verify_certs": verify_certs_flag,
+            "ssl_show_warn": ssl_show_warn_flag,
             "timeout": timeout,
             "max_retries": 3,
             "retry_on_timeout": True,
         }
+
+        if ssl_assert_hostname_value is not None:
+            self.config["ssl_assert_hostname"] = ssl_assert_hostname_value
+
+        if url_prefix:
+            self.config["url_prefix"] = url_prefix
 
         if username and password:
             self.config["http_auth"] = (username, password)
@@ -655,20 +812,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
 
-    importer = OpenSearchImporter(
-        host=args.host,
-        port=args.port,
-        username=args.username,
-        password=args.password,
-        use_ssl=args.ssl,
-        verify_certs=args.verify_certs,
-        timeout=args.timeout,
-        enable_vector=args.enable_vector,
-        vector_field=args.vector_field,
-        vector_dimension=args.vector_dim,
-        embedding_model=args.embedding_model,
-        model_cache_dir=args.model_cache,
-    )
+    try:
+        importer = OpenSearchImporter(
+            host=args.host,
+            port=args.port,
+            username=args.username,
+            password=args.password,
+            use_ssl=args.ssl,
+            verify_certs=args.verify_certs,
+            timeout=args.timeout,
+            enable_vector=args.enable_vector,
+            vector_field=args.vector_field,
+            vector_dimension=args.vector_dim,
+            embedding_model=args.embedding_model,
+            model_cache_dir=args.model_cache,
+        )
+    except ValueError:
+        return 1
 
     success = importer.import_data(args.file, args.index, batch_size=args.batch_size)
 
