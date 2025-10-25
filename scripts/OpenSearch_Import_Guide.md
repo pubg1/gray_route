@@ -1,16 +1,13 @@
 # OpenSearch 数据导入指南
 
-## 概述
+本文档说明如何把 `servicingcase_last.json` 数据集导入到 OpenSearch，并在需要时启用 `knn_vector` 字段以支持语义检索。
 
-本指南将帮助你将 `servicingcase_last.json` 文件中的汽车维修案例数据导入到 OpenSearch 中，以便进行全文搜索和分析。
+## 1. 环境准备
 
-## 前置条件
-
-### 1. OpenSearch 服务
-确保 OpenSearch 服务正在运行：
+### 1.1 OpenSearch 服务
+确保 OpenSearch 以及 Dashboards（可选）已经启动。最简单的方式是使用官方 Docker 镜像：
 
 ```bash
-# 使用 Docker 启动 OpenSearch (推荐)
 docker run -d \
   --name opensearch \
   -p 9200:9200 \
@@ -18,371 +15,116 @@ docker run -d \
   -e "discovery.type=single-node" \
   -e "OPENSEARCH_INITIAL_ADMIN_PASSWORD=MyStrongPassword123!" \
   opensearchproject/opensearch:latest
-
-# 检查服务状态
-curl http://localhost:9200
 ```
 
-### 2. Python 依赖
-安装必要的 Python 包：
+> **提示**：如果运行在云端托管环境，请确认安全组/网络策略允许访问 9200 端口，并准备好账号密码。
+
+### 1.2 Python 依赖
+项目自带的导入脚本仅依赖 `opensearch-py`。若要写入语义向量，需要额外安装 `sentence-transformers` 与（可选）`huggingface_hub`：
 
 ```bash
-# 自动安装依赖
-python scripts/install_opensearch_deps.py
+# 安装基础依赖
+pip install opensearch-py
 
-# 或手动安装
-pip install opensearch-py requests urllib3
+# 如果要写入 knn_vector，请确保安装 embedding 相关依赖
+pip install sentence-transformers huggingface-hub
 ```
 
-## 快速开始
+若你的环境无法联网，可提前在有网络的机器上下载模型，然后通过 `--model-cache` 选项指定缓存目录。
 
-### 1. 配置连接信息
-编辑 `scripts/opensearch_config.py` 文件：
+## 2. 准备数据
 
-```python
-OPENSEARCH_CONFIG = {
-    'host': 'localhost',        # OpenSearch 主机地址
-    'port': 9200,              # OpenSearch 端口
-    'username': 'admin',       # 用户名（如果需要认证）
-    'password': 'MyStrongPassword123!',  # 密码（如果需要认证）
-    'use_ssl': False,          # 是否使用 SSL
-    'verify_certs': False,     # 是否验证证书
-}
-```
+默认数据文件位于 `data/servicingcase_last.json`，采用 JSONL（每行一个 JSON 对象）格式。如果文件在其他位置，可以通过脚本参数或环境变量覆盖。
 
-### 2. 运行导入
-```bash
-# 进入脚本目录
-cd scripts
+## 3. 导入脚本 `import_to_opensearch.py`
 
-# 运行简化导入脚本
-python run_import.py
+该脚本支持以下功能：
 
-# 或使用完整功能脚本
-python import_to_opensearch.py -f ../data/servicingcase_last.json -i automotive_cases
-```
+- 自动清洗 HTML 内容并拆分出 `symptoms` / `solution` 字段；
+- 批量写入 OpenSearch（默认 100 条一批，可通过 `--batch-size` 调整）；
+- 可选地创建带 `knn_vector` 字段的索引并写入语义向量；
+- 在具备 Hugging Face 访问权限时自动下载 embedding 模型，并支持 `--model-cache` 指定缓存目录；
+- `--test` 选项可在导入完成后执行一次示例查询，快速验证数据是否可检索。
 
-## 详细使用
-
-### 数据结构转换
-
-原始数据结构：
-```json
-{
-  "_index": "servicingcase_last",
-  "_type": "carBag", 
-  "_id": "bc7ff60d313f4175a1912bbc4fd7e508",
-  "_source": {
-    "vehicletype": "CT4",
-    "discussion": "变速器油型号错误",
-    "search": "<div>详细的维修过程...</div>",
-    "searchNum": 0
-  }
-}
-```
-
-转换后的结构：
-```json
-{
-  "id": "bc7ff60d313f4175a1912bbc4fd7e508",
-  "vehicletype": "CT4",
-  "discussion": "变速器油型号错误",
-  "symptoms": "该车变速器挂D档延迟并伴随冲击...",
-  "solution": "更换变速器油后故障排除...",
-  "search_content": "清理HTML后的完整内容",
-  "search_num": 0,
-  "created_at": "2025-10-14T19:27:00"
-}
-```
-
-### 索引映射
-
-创建的索引包含以下字段：
-
-| 字段名 | 类型 | 描述 |
-|--------|------|------|
-| `id` | keyword | 唯一标识符 |
-| `vehicletype` | text | 车型信息 |
-| `discussion` | text | 故障点描述 |
-| `symptoms` | text | 故障现象 |
-| `solution` | text | 解决方案 |
-| `search_content` | text | 完整搜索内容 |
-| `search_num` | integer | 搜索次数 |
-| `created_at` | date | 创建时间 |
-
-### 命令行参数
-
-完整脚本支持以下参数：
+### 3.1 常用参数
 
 ```bash
-python import_to_opensearch.py [选项]
-
-选项:
-  -f, --file FILE       JSON文件路径 (必需)
-  -i, --index INDEX    索引名称 (默认: automotive_cases)
-  --host HOST          OpenSearch主机 (默认: localhost)
-  --port PORT          OpenSearch端口 (默认: 9200)
-  -u, --username USER  用户名
-  -p, --password PASS  密码
-  --ssl                使用SSL连接
-  --batch-size SIZE    批量导入大小 (默认: 100)
-  --test               导入后进行搜索测试
-```
-
-### 使用示例
-
-```bash
-# 基础导入
-python import_to_opensearch.py -f ../data/servicingcase_last.json
-
-# 指定索引名称
-python import_to_opensearch.py -f ../data/servicingcase_last.json -i car_cases_2024
-
-# 使用认证
-python import_to_opensearch.py \
-  -f ../data/servicingcase_last.json \
-  -u admin -p MyPassword123! \
-  --ssl
-
-# 大批量导入
-python import_to_opensearch.py \
-  -f ../data/servicingcase_last.json \
-  --batch-size 500 \
+python scripts/import_to_opensearch.py \
+  --file data/servicingcase_last.json \
+  --index automotive_cases \
+  --host localhost \
+  --port 9200 \
+  --batch-size 200 \
   --test
 ```
 
-## 搜索测试
+连接相关的可选参数包括 `--username/--password`、`--ssl` 和 `--verify-certs`。
 
-导入完成后，可以进行搜索测试：
+### 3.2 启用 kNN 语义向量
 
-### 1. 基础搜索
+要写入 `knn_vector` 字段并自动创建 kNN 索引，需要加上 `--enable-vector` 以及可选的模型参数：
+
 ```bash
-curl -X GET "localhost:9200/automotive_cases/_search" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "query": {
-      "match": {
-        "symptoms": "发动机"
-      }
-    }
-  }'
+python scripts/import_to_opensearch.py \
+  --file data/servicingcase_last.json \
+  --index cases \
+  --enable-vector \
+  --vector-field text_vector \
+  --vector-dim 512 \
+  --embedding-model BAAI/bge-small-zh-v1.5 \
+  --model-cache /opt/opensearch-models
 ```
 
-### 2. 多字段搜索
+脚本会按以下顺序尝试加载 embedding：
+
+1. 复用应用内的 `app.embedding.get_embedder()`；
+2. 使用 `--embedding-model` 指定的 SentenceTransformer 模型；
+3. 若未指定模型，则读取应用配置中的 `embedding_model`（默认 `BAAI/bge-small-zh-v1.5`）。
+
+只要安装了 `huggingface_hub`，脚本会在运行前自动尝试使用 `snapshot_download` 将模型缓存到 `--model-cache` 指定目录；若未指定缓存目录，则使用 Hugging Face 默认缓存位置。缓存目录会通过 `SENTENCE_TRANSFORMERS_HOME` 与 `HUGGINGFACE_HUB_CACHE` 环境变量传递给下游库。
+
+## 4. Shell 封装脚本 `import_cases_knn.sh`
+
+为了方便快速导入 `cases` 索引，仓库提供了 `scripts/import_cases_knn.sh`：
+
 ```bash
-curl -X GET "localhost:9200/automotive_cases/_search" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "query": {
-      "multi_match": {
-        "query": "刹车发软",
-        "fields": ["symptoms^2", "discussion^1.5", "solution"]
-      }
-    }
-  }'
+./scripts/import_cases_knn.sh path/to/servicingcase_last.json
 ```
 
-### 3. 车型过滤搜索
-```bash
-curl -X GET "localhost:9200/automotive_cases/_search" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "query": {
-      "bool": {
-        "must": {
-          "match": {"symptoms": "启动困难"}
-        },
-        "filter": {
-          "term": {"vehicletype.keyword": "宋"}
-        }
-      }
-    }
-  }'
-```
+如果未传入参数，脚本会优先使用环境变量 `OPENSEARCH_DATA_FILE`，否则回退到 `data/servicingcase_last.json`。
 
-## 故障排查
+常用环境变量说明：
 
-### 常见问题
+| 变量 | 说明 | 默认值 |
+| ---- | ---- | ------ |
+| `OPENSEARCH_HOST` | OpenSearch 主机名 | `localhost` |
+| `OPENSEARCH_PORT` | OpenSearch 端口 | `9200` |
+| `OPENSEARCH_USERNAME` / `OPENSEARCH_PASSWORD` | 认证信息 | 空 |
+| `OPENSEARCH_SSL` | 是否开启 `--ssl` | `false` |
+| `OPENSEARCH_VERIFY_CERTS` | 是否传递 `--verify-certs` | `false` |
+| `OPENSEARCH_TIMEOUT` | 请求超时时间（秒） | `30` |
+| `OPENSEARCH_INDEX` | 索引名称 | `cases` |
+| `OPENSEARCH_BATCH_SIZE` | 批量大小 | `200` |
+| `OPENSEARCH_VECTOR_FIELD` | 向量字段 | `text_vector` |
+| `OPENSEARCH_VECTOR_DIM` | 向量维度 | `512` |
+| `EMBEDDING_MODEL` | 覆盖默认 embedding 模型 | 空（复用应用配置） |
+| `MODEL_CACHE_DIR` | 模型缓存目录 | 空 |
+| `PYTHON_BIN` | 指定 Python 解释器 | `python3` |
 
-#### 1. 连接失败
-```
-❌ 连接 OpenSearch 失败: ConnectionError
-```
+该脚本内部调用 `import_to_opensearch.py --enable-vector`，并自动传递上述参数。
 
-**解决方法:**
-- 检查 OpenSearch 服务是否运行: `curl http://localhost:9200`
-- 检查防火墙设置
-- 确认主机和端口配置正确
+## 5. 验证 kNN 功能
 
-#### 2. 认证失败
-```
-❌ 连接 OpenSearch 失败: AuthenticationException
-```
+1. 导入完成后，执行 `GET /cases/_mapping`，确认映射中存在 `text_vector` 字段，类型为 `knn_vector`，且索引设置包含 `"index.knn": true`。
+2. 调用 `GET /_plugins/_knn/stats`，观察 `knn_query_requests` 是否随查询增加。
+3. 在应用或脚本中执行示例查询，验证语义检索结果。
 
-**解决方法:**
-- 检查用户名和密码是否正确
-- 确认是否需要SSL连接
-- 检查用户权限
+若集群版本低于 2.9，顶层 `knn` 查询不可用，可在查询 DSL 中通过 `query.bool.must[].knn` 的形式嵌入语义检索；脚本生成的索引与向量字段同样可用。
 
-#### 3. 索引创建失败
-```
-❌ 创建索引失败: resource_already_exists_exception
-```
+## 6. 故障排查
 
-**解决方法:**
-- 删除现有索引: `curl -X DELETE "localhost:9200/automotive_cases"`
-- 或使用不同的索引名称
+- **提示 `Unknown key for a START_OBJECT in [knn]`**：索引未开启 `index.knn` 或集群版本过低。请升级到 OpenSearch ≥ 2.9，或在查询 DSL 中使用 `query.bool.must[].knn` 形式。
+- **模型下载缓慢**：可提前使用 `huggingface-cli download` 或 `snapshot_download` 将模型缓存到本地，然后通过 `--model-cache` 指向缓存目录。
+- **导入报错缺少 `sentence_transformers`**：安装 `sentence-transformers` 即可；如果只需关键字检索，可去掉 `--enable-vector`。
 
-#### 4. 导入数据为空
-```
-✅ 成功转换 0 条记录
-```
-
-**解决方法:**
-- 检查JSON文件格式是否正确
-- 确认文件路径是否存在
-- 检查文件编码（应为UTF-8）
-
-### 调试技巧
-
-#### 1. 查看索引状态
-```bash
-# 查看所有索引
-curl http://localhost:9200/_cat/indices?v
-
-# 查看索引映射
-curl http://localhost:9200/automotive_cases/_mapping
-
-# 查看文档数量
-curl http://localhost:9200/automotive_cases/_count
-```
-
-#### 2. 查看导入日志
-脚本会输出详细的导入日志，包括：
-- 连接状态
-- 数据转换进度
-- 批量导入结果
-- 错误信息
-
-#### 3. 手动测试单条记录
-```python
-# 测试脚本
-from opensearchpy import OpenSearch
-
-client = OpenSearch([{'host': 'localhost', 'port': 9200}])
-
-# 插入测试文档
-doc = {
-    'vehicletype': '测试车型',
-    'symptoms': '测试故障现象',
-    'discussion': '测试故障点'
-}
-
-response = client.index(
-    index='test_index',
-    id='test_doc',
-    body=doc
-)
-print(response)
-```
-
-## 性能优化
-
-### 1. 批量大小调整
-- 小文件: `--batch-size 50`
-- 大文件: `--batch-size 500`
-- 内存充足: `--batch-size 1000`
-
-### 2. 索引设置优化
-```python
-# 在 import_to_opensearch.py 中调整
-"settings": {
-    "number_of_shards": 1,      # 单节点使用1个分片
-    "number_of_replicas": 0,    # 开发环境不需要副本
-    "refresh_interval": "30s"   # 降低刷新频率
-}
-```
-
-### 3. 硬件要求
-- **内存**: 最少 2GB，推荐 4GB+
-- **磁盘**: 数据大小的 2-3 倍空间
-- **CPU**: 2核心以上
-
-## 集成到应用
-
-导入完成后，可以在应用中使用 OpenSearch 进行搜索：
-
-```python
-from opensearchpy import OpenSearch
-
-# 连接 OpenSearch
-client = OpenSearch([{'host': 'localhost', 'port': 9200}])
-
-# 搜索函数
-def search_cases(query, vehicle_type=None, size=10):
-    search_body = {
-        "query": {
-            "bool": {
-                "must": {
-                    "multi_match": {
-                        "query": query,
-                        "fields": ["symptoms^2", "discussion^1.5", "solution"]
-                    }
-                }
-            }
-        },
-        "size": size
-    }
-    
-    # 添加车型过滤
-    if vehicle_type:
-        search_body["query"]["bool"]["filter"] = {
-            "term": {"vehicletype.keyword": vehicle_type}
-        }
-    
-    response = client.search(index="automotive_cases", body=search_body)
-    return response['hits']['hits']
-
-# 使用示例
-results = search_cases("发动机无法启动", vehicle_type="宋")
-for hit in results:
-    print(f"车型: {hit['_source']['vehicletype']}")
-    print(f"故障: {hit['_source']['discussion']}")
-    print(f"评分: {hit['_score']}")
-```
-
-## 维护和监控
-
-### 1. 定期备份
-```bash
-# 创建快照仓库
-curl -X PUT "localhost:9200/_snapshot/backup_repo" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "type": "fs",
-    "settings": {
-      "location": "/backup"
-    }
-  }'
-
-# 创建快照
-curl -X PUT "localhost:9200/_snapshot/backup_repo/snapshot_1"
-```
-
-### 2. 监控索引健康
-```bash
-# 查看集群健康状态
-curl http://localhost:9200/_cluster/health
-
-# 查看索引统计
-curl http://localhost:9200/automotive_cases/_stats
-```
-
-### 3. 清理和重建
-```bash
-# 删除索引
-curl -X DELETE "localhost:9200/automotive_cases"
-
-# 重新导入
-python run_import.py
-```
+按照以上步骤操作，即可顺利将汽车案例数据导入 OpenSearch，并启用语义检索能力。
