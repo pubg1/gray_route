@@ -112,36 +112,6 @@ class OpenSearchImporter:
 
         raise ValueError(f"OpenSearch {name} 配置无效: {value!r}")
 
-    @classmethod
-    def _normalize_ssl_assert_hostname(cls, value: Any, host: str) -> Any:
-        """Sanitize the ``ssl_assert_hostname`` option for urllib3 compatibility."""
-
-        if value is None:
-            return host
-
-        if isinstance(value, bool):
-            return host if value else False
-
-        if isinstance(value, (int, float)):
-            if value in (0, 1):
-                return host if bool(value) else False
-            raise ValueError("OpenSearch ssl_assert_hostname 配置无效: 仅支持 0/1")
-
-        if isinstance(value, str):
-            normalized = value.strip()
-            if not normalized:
-                return host
-
-            lowered = normalized.lower()
-            if lowered in {"true", "1", "yes", "y", "on"}:
-                return host
-            if lowered in {"false", "0", "no", "n", "off"}:
-                return False
-
-            return normalized
-
-        raise ValueError(f"OpenSearch ssl_assert_hostname 配置无效: {value!r}")
-
     @staticmethod
     def _normalize_host(raw_host: Any) -> str:
         """Ensure the OpenSearch host value is a non-empty hostname string."""
@@ -231,6 +201,9 @@ class OpenSearchImporter:
         try:
             use_ssl_flag = self._coerce_bool("use_ssl", use_ssl)
             verify_certs_flag = self._coerce_bool("verify_certs", verify_certs)
+            ssl_assert_hostname_flag = self._coerce_bool(
+                "ssl_assert_hostname", ssl_assert_hostname, default=True
+            )
             ssl_show_warn_flag = self._coerce_bool(
                 "ssl_show_warn", ssl_show_warn, default=True
             )
@@ -246,30 +219,17 @@ class OpenSearchImporter:
             logger.error("无效的 OpenSearch 连接配置: %s", exc)
             raise
 
-        try:
-            ssl_assert_hostname_value = self._normalize_ssl_assert_hostname(
-                ssl_assert_hostname, host_value
-            )
-        except ValueError as exc:
-            logger.error("无效的 OpenSearch 连接配置: %s", exc)
-            raise
-
-        if not verify_certs_flag:
-            ssl_assert_hostname_value = False
-
         self.config = {
             "hosts": [{"host": host_value, "port": port_value}],
             "http_compress": True,
             "use_ssl": use_ssl_flag,
             "verify_certs": verify_certs_flag,
+            "ssl_assert_hostname": ssl_assert_hostname_flag,
             "ssl_show_warn": ssl_show_warn_flag,
             "timeout": timeout,
             "max_retries": 3,
             "retry_on_timeout": True,
         }
-
-        if ssl_assert_hostname_value is not None:
-            self.config["ssl_assert_hostname"] = ssl_assert_hostname_value
 
         if url_prefix:
             self.config["url_prefix"] = url_prefix
