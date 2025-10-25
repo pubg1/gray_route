@@ -308,6 +308,13 @@ class OpenSearchMatcher:
                 self.embedder = get_embedder()
                 self.semantic_available = True
                 logger.info("语义检索已启用: 成功加载向量模型")
+                if self.vector_field and not self._vector_field_is_configured():
+                    logger.warning(
+                        "索引 %s 的向量字段 %s 未配置为 knn_vector 类型，语义检索已自动禁用",
+                        INDEX_CONFIG.get('name'),
+                        self.vector_field,
+                    )
+                    self.semantic_available = False
             except Exception as embed_err:  # pragma: no cover - 模型加载失败较难复现
                 logger.warning(f"加载语义向量模型失败，已自动关闭语义检索: {embed_err}")
         else:
@@ -463,6 +470,66 @@ class OpenSearchMatcher:
             "is not a knn_vector",
         ]
         return any(keyword in lower for keyword in keywords)
+
+    @staticmethod
+    def _lookup_field_mapping(properties: Dict[str, Any], field_path: str) -> Optional[Dict[str, Any]]:
+        if not isinstance(properties, dict):
+            return None
+        parts = [part for part in str(field_path).split('.') if part]
+        current: Optional[Dict[str, Any]] = properties
+        for idx, part in enumerate(parts):
+            if not isinstance(current, dict):
+                return None
+            prop_map = current.get('properties') if idx else current
+            if not isinstance(prop_map, dict):
+                return None
+            field_mapping = prop_map.get(part)
+            if field_mapping is None:
+                return None
+            if idx == len(parts) - 1:
+                return field_mapping if isinstance(field_mapping, dict) else None
+            current = field_mapping
+        return None
+
+    @staticmethod
+    def _is_knn_vector_mapping(field_mapping: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(field_mapping, dict):
+            return False
+        field_type = str(field_mapping.get('type', '')).lower()
+        if field_type == 'knn_vector':
+            return True
+        return False
+
+    def _vector_field_is_configured(self) -> bool:
+        index_name = INDEX_CONFIG.get('name')
+        if not index_name:
+            return False
+        try:
+            mapping = self.client.indices.get_mapping(index=index_name)
+        except Exception as err:
+            logger.warning(
+                "无法验证向量字段 %s 是否配置为 knn_vector: %s",
+                self.vector_field,
+                err,
+            )
+            return True
+
+        for index_mapping in mapping.values():
+            mappings = index_mapping.get('mappings', {})
+            properties = mappings.get('properties') if isinstance(mappings, dict) else {}
+            field_mapping = self._lookup_field_mapping(properties, self.vector_field)
+            if field_mapping is None:
+                continue
+            if self._is_knn_vector_mapping(field_mapping):
+                return True
+            field_type = field_mapping.get('type') if isinstance(field_mapping, dict) else None
+            logger.warning(
+                "索引 %s 的字段 %s 类型为 %s，非 knn_vector", index_name, self.vector_field, field_type
+            )
+            return False
+
+        logger.warning("索引 %s 中未找到向量字段 %s", index_name, self.vector_field)
+        return False
 
     def _encode_query(self, query: str) -> Optional[List[float]]:
         if not self.embedder:
