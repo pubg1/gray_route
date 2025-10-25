@@ -4,6 +4,12 @@
 汽车故障诊断 API 测试脚本
 """
 
+import pytest
+
+pytestmark = pytest.mark.skip(
+    reason="Requires running API service; skip during automated pytest runs."
+)
+
 import requests
 import json
 import time
