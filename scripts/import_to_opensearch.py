@@ -210,6 +210,44 @@ class OpenSearchImporter:
 
         return host_value, port_value, ssl_flag, url_prefix
 
+    @staticmethod
+    def _parse_version(version: str) -> Tuple[int, int, int]:
+        parts = [int(part) for part in re.findall(r"\d+", version)[:3]]
+        while len(parts) < 3:
+            parts.append(0)
+        return parts[0], parts[1], parts[2]
+
+    @classmethod
+    def _select_knn_engine(cls, version: str) -> str:
+        try:
+            major, minor, _ = cls._parse_version(version)
+        except Exception:
+            return "nmslib"
+
+        if major >= 3:
+            return "lucene"
+        if major == 2 and minor >= 12:
+            return "lucene"
+        return "nmslib"
+
+    def _build_knn_field(self) -> Dict[str, Any]:
+        method: Dict[str, Any] = {
+            "name": "hnsw",
+            "space_type": "cosinesimil",
+            "engine": self.knn_engine,
+        }
+        if self.knn_engine == "nmslib":
+            method["parameters"] = {
+                "ef_construction": 128,
+                "m": 16,
+            }
+
+        return {
+            "type": "knn_vector",
+            "dimension": self.vector_dimension,
+            "method": method,
+        }
+
     def __init__(
         self,
         host: str = "localhost",
@@ -244,6 +282,8 @@ class OpenSearchImporter:
         except ValueError as exc:
             logger.error("无效的 OpenSearch 连接配置: %s", exc)
             raise
+
+        self.knn_engine = "nmslib"
 
         try:
             host_value, port_value, use_ssl_flag, url_prefix = self._normalize_endpoint(
@@ -292,7 +332,9 @@ class OpenSearchImporter:
             self.client = OpenSearch(**self.config)
             info = self.client.info()
             self.server_version = info.get("version", {}).get("number", "unknown")
+            self.knn_engine = self._select_knn_engine(self.server_version)
             logger.info("成功连接到 OpenSearch: %s", self.server_version)
+            logger.info("kNN 向量引擎: %s", self.knn_engine)
         except Exception as exc:  # pragma: no cover - 连接失败时直接抛出
             logger.error("连接 OpenSearch 失败: %s", exc)
             raise
@@ -311,6 +353,12 @@ class OpenSearchImporter:
         self.vector_dimension = vector_dimension
         self.embedding_model = embedding_model.strip() if embedding_model else None
         self.model_cache_dir = model_cache_dir.strip() if model_cache_dir else None
+        clone_target = clone_source_index
+        if clone_target is None and not preserve_flag:
+            clone_target = "automotive_cases"
+        if isinstance(clone_target, str):
+            clone_target = clone_target.strip()
+        self.clone_source_index = clone_target or None
         self.clone_source_index = (
             clone_source_index.strip() if clone_source_index else None
         )
@@ -716,6 +764,16 @@ class OpenSearchImporter:
             }
         }
 
+    def _build_preserve_mapping(self) -> Dict[str, Any]:
+        return {
+            "mappings": {
+                "dynamic": True,
+                "properties": {
+                    "id": {"type": "keyword"},
+                },
+            }
+        }
+
     def create_index_mapping(self, index_name: str) -> bool:
         try:
             if self.client.indices.exists(index=index_name):
@@ -752,6 +810,10 @@ class OpenSearchImporter:
                     )
 
             if not cloned:
+                if self.preserve_source_fields:
+                    body = self._build_preserve_mapping()
+                else:
+                    body = self._build_default_mapping()
                 body = self._build_default_mapping()
 
             if self.enable_vector:
@@ -762,6 +824,7 @@ class OpenSearchImporter:
                         "向量字段 %s 已存在于映射中，将沿用现有定义", self.vector_field
                     )
                 else:
+                    properties[self.vector_field] = self._build_knn_field()
                     properties[self.vector_field] = {
                         "type": "knn_vector",
                         "dimension": self.vector_dimension,
@@ -797,19 +860,7 @@ class OpenSearchImporter:
             try:
                 body = {
                     "properties": {
-                        self.vector_field: {
-                            "type": "knn_vector",
-                            "dimension": self.vector_dimension,
-                            "method": {
-                                "name": "hnsw",
-                                "space_type": "cosinesimil",
-                                "engine": "nmslib",
-                                "parameters": {
-                                    "ef_construction": 128,
-                                    "m": 16,
-                                },
-                            },
-                        }
+                        self.vector_field: self._build_knn_field()
                     }
                 }
                 self.client.indices.put_mapping(index=index_name, body=body)
@@ -832,6 +883,17 @@ class OpenSearchImporter:
                     dimension,
                 )
                 self.vector_dimension = int(dimension)
+
+            existing_engine = (
+                vector_mapping.get("method", {}).get("engine")
+            )
+            if existing_engine and existing_engine != self.knn_engine:
+                logger.info(
+                    "索引 %s 的向量字段使用引擎 %s，与当前配置 %s 不一致，保留现有设置",
+                    index_name,
+                    existing_engine,
+                    self.knn_engine,
+                )
 
         try:
             settings = self.client.indices.get_settings(index=index_name)
@@ -964,6 +1026,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--model-cache", help="embedding 模型缓存目录")
     parser.add_argument(
         "--clone-mapping-from",
+        default=None,
+        help="从指定索引克隆映射，保留所有原字段 (留空表示不克隆)",
         default="automotive_cases",
         help="从指定索引克隆映射，保留所有原字段",
     )

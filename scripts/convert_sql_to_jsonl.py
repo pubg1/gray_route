@@ -22,6 +22,7 @@ import re
 import sys
 from collections import Counter
 from dataclasses import dataclass
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 from typing import Iterator, List, Optional, Sequence, Tuple
 from zipfile import ZipFile
 
@@ -31,6 +32,11 @@ INSERT_REGEX = re.compile(
     r"INSERT\s+INTO\s+`?(?P<table>[^`(\s]+)`?\s*(?P<columns>\([^)]*\))?\s*VALUES\s*(?P<values>.+?);",
     re.IGNORECASE | re.DOTALL,
 )
+CREATE_TABLE_REGEX = re.compile(
+    r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`?(?P<table>[^`(\s]+)`?\s*\(",
+    re.IGNORECASE,
+)
+COLUMN_NAME_REGEX = re.compile(r"^`?(?P<name>[A-Za-z0-9_]+)`?")
 NUMBER_REGEX = re.compile(r"^-?\d+(?:\.\d+)?$")
 
 
@@ -176,6 +182,183 @@ def _parse_value_tuple(tuple_text: str) -> List[object]:
     return values
 
 
+def _split_column_block(block: str) -> List[str]:
+    parts: List[str] = []
+    current: List[str] = []
+    depth = 0
+    in_string: Optional[str] = None
+    index = 0
+    length = len(block)
+
+    while index < length:
+        char = block[index]
+
+        if in_string:
+            if char == "\\":
+                current.append(char)
+                if index + 1 < length:
+                    current.append(block[index + 1])
+                    index += 2
+                    continue
+                index += 1
+                continue
+
+            if char == in_string:
+                if char == "'" and index + 1 < length and block[index + 1] == "'":
+                    current.append(char)
+                    current.append(block[index + 1])
+                    index += 2
+                    continue
+                in_string = None
+
+            current.append(char)
+            index += 1
+            continue
+
+        if char in ("'", '"'):
+            in_string = char
+            current.append(char)
+            index += 1
+            continue
+
+        if char == "(":
+            depth += 1
+            current.append(char)
+            index += 1
+            continue
+
+        if char == ")":
+            if depth > 0:
+                depth -= 1
+            current.append(char)
+            index += 1
+            continue
+
+        if char == "," and depth == 0:
+            part = "".join(current).strip()
+            if part:
+                parts.append(part)
+            current = []
+            index += 1
+            continue
+
+        current.append(char)
+        index += 1
+
+    tail = "".join(current).strip()
+    if tail:
+        parts.append(tail)
+
+    return parts
+
+
+def _extract_parenthesized_block(text: str, start_index: int) -> Tuple[str, int]:
+    depth = 0
+    in_string: Optional[str] = None
+    escape = False
+    buffer: List[str] = []
+
+    for index in range(start_index, len(text)):
+        char = text[index]
+        buffer.append(char)
+
+        if in_string:
+            if escape:
+                escape = False
+                continue
+
+            if char == "\\":
+                escape = True
+                continue
+
+            if char == in_string:
+                if char == "'" and index + 1 < len(text) and text[index + 1] == "'":
+                    buffer.append("'")
+                    continue
+                in_string = None
+            continue
+
+        if char in ("'", '"'):
+            in_string = char
+            continue
+
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return "".join(buffer), index + 1
+
+    raise SQLParseError("CREATE TABLE 定义缺少右括号")
+
+
+def _extract_table_columns(sql_text: str) -> Dict[str, List[str]]:
+    columns_map: Dict[str, List[str]] = {}
+    position = 0
+    reserved_prefixes = ("primary", "unique", "key", "constraint", "foreign", "index", "fulltext")
+
+    while True:
+        match = CREATE_TABLE_REGEX.search(sql_text, position)
+        if not match:
+            break
+
+        table = match.group("table")
+        block, end_index = _extract_parenthesized_block(sql_text, match.end() - 1)
+        inner = block[1:-1]
+        definitions = _split_column_block(inner)
+        collected: List[str] = []
+
+        for definition in definitions:
+            stripped = definition.strip()
+            if not stripped:
+                continue
+            lower = stripped.lstrip("`\"").lower()
+            if lower.startswith(reserved_prefixes):
+                continue
+
+            name_match = COLUMN_NAME_REGEX.match(stripped)
+            if name_match:
+                collected.append(name_match.group("name"))
+
+        if collected:
+            columns_map[table.lower()] = collected
+
+        position = end_index
+
+    return columns_map
+
+
+def _normalize_columns(
+    raw_columns: Optional[str],
+    value_count: int,
+    *,
+    fallback: Optional[Sequence[str]] = None,
+    table: Optional[str] = None,
+) -> List[str]:
+    if raw_columns:
+        inner = raw_columns.strip()[1:-1]
+        columns = [col.strip().strip("`\"") for col in inner.split(",")]
+        return [column for column in columns if column]
+
+    if fallback and len(fallback) == value_count:
+        return list(fallback)
+
+    if fallback and table:
+        LOGGER.warning(
+            "表 %s 的列定义数量 (%s) 与数据数量 (%s) 不一致，已使用 col_x 占位列",
+            table,
+            len(fallback),
+            value_count,
+        )
+
+    return [f"col_{idx}" for idx in range(value_count)]
+
+
+def iter_insert_statements(
+    sql_text: str,
+    *,
+    column_definitions: Optional[Dict[str, Sequence[str]]] = None,
+) -> Iterator[InsertStatement]:
 def _normalize_columns(raw_columns: Optional[str], value_count: int) -> List[str]:
     if not raw_columns:
         return [f"col_{idx}" for idx in range(value_count)]
@@ -192,6 +375,15 @@ def iter_insert_statements(sql_text: str) -> Iterator[InsertStatement]:
         try:
             for tuple_text in _split_value_tuples(values_block):
                 parsed_values = _parse_value_tuple(tuple_text)
+                fallback = None
+                if column_definitions:
+                    fallback = column_definitions.get(table.lower())
+                columns = _normalize_columns(
+                    raw_columns,
+                    len(parsed_values),
+                    fallback=fallback,
+                    table=table,
+                )
                 columns = _normalize_columns(raw_columns, len(parsed_values))
                 if len(columns) != len(parsed_values):
                     LOGGER.warning(
@@ -240,6 +432,12 @@ def convert_zip_to_jsonl(
 
             raw_text = _decode_bytes(archive.read(entry), decode_encodings)
             LOGGER.info("正在解析 SQL 文件: %s", entry.filename)
+            column_map = _extract_table_columns(raw_text)
+
+            for statement in iter_insert_statements(
+                raw_text,
+                column_definitions=column_map,
+            ):
 
             for statement in iter_insert_statements(raw_text):
                 table_lower = statement.table.lower()

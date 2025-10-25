@@ -94,6 +94,36 @@ VECTOR_FIELD=${OPENSEARCH_VECTOR_FIELD:-text_vector}
 VECTOR_DIM=${OPENSEARCH_VECTOR_DIM:-512}
 EMBED_MODEL=${EMBEDDING_MODEL:-}
 MODEL_CACHE=${MODEL_CACHE_DIR:-}
+CLONE_SOURCE=${OPENSEARCH_CLONE_FROM:-automotive_cases}
+if [[ "${INDEX}" == cases_recovery && -z "${OPENSEARCH_CLONE_FROM:-}" ]]; then
+  CLONE_SOURCE=""
+fi
+
+TEMP_JSON=""
+
+cleanup_temp() {
+  if [[ -n "${TEMP_JSON}" && -f "${TEMP_JSON}" ]]; then
+    rm -f "${TEMP_JSON}"
+  fi
+}
+
+shopt -s nocasematch
+if [[ "${DATA_FILE}" == *.zip ]]; then
+  TEMP_JSON=$(mktemp "${TMPDIR:-/tmp}/cases_import_XXXXXX.jsonl")
+  trap cleanup_temp EXIT
+  TABLE_ARGS=()
+  if [[ -n "${SQL_TABLES:-}" ]]; then
+    TABLE_ARGS=(--tables ${SQL_TABLES})
+  fi
+  echo "[信息] 检测到 ZIP 数据包，正在转换为 JSONL: ${DATA_FILE}" >&2
+  "${PYTHON_BIN}" "${SCRIPT_DIR}/convert_sql_to_jsonl.py" \
+    --zip "${DATA_FILE}" \
+    --output "${TEMP_JSON}" \
+    --index "${INDEX}" \
+    "${TABLE_ARGS[@]}"
+  DATA_FILE="${TEMP_JSON}"
+fi
+shopt -u nocasematch
 
 TEMP_JSON=""
 
@@ -134,6 +164,10 @@ CMD=("${PYTHON_BIN}" "${SCRIPT_DIR}/import_to_opensearch.py"
   "--vector-dim" "${VECTOR_DIM}"
   "--preserve-source-fields"
   "--recreate-index")
+
+if [[ -n "${CLONE_SOURCE}" ]]; then
+  CMD+=("--clone-mapping-from" "${CLONE_SOURCE}")
+fi
 
 if [[ -n "${USERNAME}" && -n "${PASSWORD}" ]]; then
   CMD+=("--username" "${USERNAME}" "--password" "${PASSWORD}")
