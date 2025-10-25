@@ -23,7 +23,6 @@ import sys
 from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
-from typing import Iterator, List, Optional, Sequence, Tuple
 from zipfile import ZipFile
 
 LOGGER = logging.getLogger(__name__)
@@ -359,15 +358,6 @@ def iter_insert_statements(
     *,
     column_definitions: Optional[Dict[str, Sequence[str]]] = None,
 ) -> Iterator[InsertStatement]:
-def _normalize_columns(raw_columns: Optional[str], value_count: int) -> List[str]:
-    if not raw_columns:
-        return [f"col_{idx}" for idx in range(value_count)]
-    inner = raw_columns.strip()[1:-1]
-    columns = [col.strip().strip("`\"") for col in inner.split(",")]
-    return [column for column in columns if column]
-
-
-def iter_insert_statements(sql_text: str) -> Iterator[InsertStatement]:
     for match in INSERT_REGEX.finditer(sql_text):
         table = match.group("table")
         raw_columns = match.group("columns")
@@ -384,7 +374,6 @@ def iter_insert_statements(sql_text: str) -> Iterator[InsertStatement]:
                     fallback=fallback,
                     table=table,
                 )
-                columns = _normalize_columns(raw_columns, len(parsed_values))
                 if len(columns) != len(parsed_values):
                     LOGGER.warning(
                         "列数量与数据数量不一致 (table=%s): %s vs %s", table, len(columns), len(parsed_values)
@@ -438,8 +427,6 @@ def convert_zip_to_jsonl(
                 raw_text,
                 column_definitions=column_map,
             ):
-
-            for statement in iter_insert_statements(raw_text):
                 table_lower = statement.table.lower()
                 if allowed_tables and table_lower not in allowed_tables:
                     continue
