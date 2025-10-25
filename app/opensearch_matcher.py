@@ -10,7 +10,7 @@ import os
 import re
 import sys
 import logging
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from opensearchpy import OpenSearch
 
@@ -295,6 +295,7 @@ class OpenSearchMatcher:
         self.embedder = None
         self.semantic_available = False
         self._knn_query_style = 'top_level'
+        self._knn_supports_num_candidates = True
         version_major_minor = version_tuple[:2] if version_tuple else tuple()
         if version_major_minor and version_major_minor < (2, 9):
             self._knn_query_style = 'nested'
@@ -385,13 +386,15 @@ class OpenSearchMatcher:
         num_candidates = max(vector_k * 4, self.vector_num_candidates)
 
         if self._knn_query_style == 'nested':
+            nested_body: Dict[str, Any] = {
+                "vector": list(query_vector),
+                "k": vector_k,
+            }
+            if self._knn_supports_num_candidates:
+                nested_body["num_candidates"] = num_candidates
             knn_clause = {
                 "knn": {
-                    self.vector_field: {
-                        "vector": list(query_vector),
-                        "k": vector_k,
-                        "num_candidates": num_candidates,
-                    }
+                    self.vector_field: nested_body
                 }
             }
             bool_query.setdefault("must", [])
@@ -408,13 +411,21 @@ class OpenSearchMatcher:
             "query": {
                 "bool": bool_query
             },
-            "knn": {
-                "field": self.vector_field,
-                "query_vector": list(query_vector),
-                "k": vector_k,
-                "num_candidates": num_candidates
-            }
+            "knn": self._build_top_level_knn_payload(query_vector, vector_k, num_candidates)
         }
+
+    def _build_top_level_knn_payload(self,
+                                     query_vector: Sequence[float],
+                                     vector_k: int,
+                                     num_candidates: int) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "field": self.vector_field,
+            "query_vector": list(query_vector),
+            "k": vector_k,
+        }
+        if self._knn_supports_num_candidates:
+            payload["num_candidates"] = num_candidates
+        return payload
 
     @staticmethod
     def _should_use_nested_knn(error: Exception) -> bool:
@@ -426,6 +437,20 @@ class OpenSearchMatcher:
             "parsing_exception",
         ]
         return any(keyword in message for keyword in keywords)
+
+    @staticmethod
+    def _should_disable_num_candidates(error: Exception) -> bool:
+        message = str(error)
+        lower = message.lower()
+        return (
+            "num_candidates" in lower
+            and (
+                "unknown" in lower
+                or "unrecognized" in lower
+                or "parsing_exception" in lower
+                or "x_content_parse_exception" in lower
+            )
+        )
 
     def _encode_query(self, query: str) -> Optional[List[float]]:
         if not self.embedder:
@@ -565,36 +590,48 @@ class OpenSearchMatcher:
             if effective_semantic and self.vector_field:
                 query_vector = self._encode_query(query)
                 if query_vector is not None:
-                    knn_body = self._build_knn_body(query_vector, vector_k, filters)
-                    try:
-                        knn_resp = self.client.search(
-                            index=INDEX_CONFIG['name'],
-                            body=knn_body
-                        )
-                    except Exception as knn_err:
-                        if (
-                            self._knn_query_style == 'top_level'
-                            and self._should_use_nested_knn(knn_err)
-                        ):
-                            logger.warning(
-                                "顶层 kNN 查询失败，自动回退到 bool.must 语法: %s",
-                                knn_err
+                    knn_resp = None
+                    attempted_states: Set[Tuple[str, bool]] = set()
+                    while True:
+                        state = (self._knn_query_style, self._knn_supports_num_candidates)
+                        if state in attempted_states:
+                            logger.error("语义检索失败: kNN 查询在重复状态下仍无法执行")
+                            break
+                        attempted_states.add(state)
+                        knn_body = self._build_knn_body(query_vector, vector_k, filters)
+                        try:
+                            knn_resp = self.client.search(
+                                index=INDEX_CONFIG['name'],
+                                body=knn_body
                             )
-                            self._knn_query_style = 'nested'
-                            knn_body = self._build_knn_body(query_vector, vector_k, filters)
-                            try:
-                                knn_resp = self.client.search(
-                                    index=INDEX_CONFIG['name'],
-                                    body=knn_body
+                            break
+                        except Exception as knn_err:
+                            if (
+                                self._knn_supports_num_candidates
+                                and self._should_disable_num_candidates(knn_err)
+                            ):
+                                logger.warning(
+                                    "kNN 查询不支持 num_candidates 参数，自动移除: %s",
+                                    knn_err
                                 )
-                            except Exception as nested_err:
-                                logger.error(f"语义检索失败: {nested_err}")
-                                effective_semantic = False
-                                knn_resp = None
-                        else:
+                                self._knn_supports_num_candidates = False
+                                continue
+                            if (
+                                self._knn_query_style == 'top_level'
+                                and self._should_use_nested_knn(knn_err)
+                            ):
+                                logger.warning(
+                                    "顶层 kNN 查询失败，自动回退到 bool.must 语法: %s",
+                                    knn_err
+                                )
+                                self._knn_query_style = 'nested'
+                                continue
                             logger.error(f"语义检索失败: {knn_err}")
                             effective_semantic = False
                             knn_resp = None
+                            break
+                    if knn_resp is None:
+                        effective_semantic = False
                     if knn_resp:
                         for hit in knn_resp['hits']['hits']:
                             doc_id, source = self._extract_source(hit)
