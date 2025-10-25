@@ -125,6 +125,32 @@ if [[ "${DATA_FILE}" == *.zip ]]; then
 fi
 shopt -u nocasematch
 
+TEMP_JSON=""
+
+cleanup_temp() {
+  if [[ -n "${TEMP_JSON}" && -f "${TEMP_JSON}" ]]; then
+    rm -f "${TEMP_JSON}"
+  fi
+}
+
+shopt -s nocasematch
+if [[ "${DATA_FILE}" == *.zip ]]; then
+  TEMP_JSON=$(mktemp "${TMPDIR:-/tmp}/cases_import_XXXXXX.jsonl")
+  trap cleanup_temp EXIT
+  TABLE_ARGS=()
+  if [[ -n "${SQL_TABLES:-}" ]]; then
+    TABLE_ARGS=(--tables ${SQL_TABLES})
+  fi
+  echo "[信息] 检测到 ZIP 数据包，正在转换为 JSONL: ${DATA_FILE}" >&2
+  "${PYTHON_BIN}" "${SCRIPT_DIR}/convert_sql_to_jsonl.py" \
+    --zip "${DATA_FILE}" \
+    --output "${TEMP_JSON}" \
+    --index "${INDEX}" \
+    "${TABLE_ARGS[@]}"
+  DATA_FILE="${TEMP_JSON}"
+fi
+shopt -u nocasematch
+
 CMD=("${PYTHON_BIN}" "${SCRIPT_DIR}/import_to_opensearch.py"
   "--file" "${DATA_FILE}"
   "--index" "${INDEX}"
@@ -132,6 +158,7 @@ CMD=("${PYTHON_BIN}" "${SCRIPT_DIR}/import_to_opensearch.py"
   "--port" "${PORT}"
   "--timeout" "${TIMEOUT}"
   "--batch-size" "${BATCH_SIZE}"
+  "--clone-mapping-from" "automotive_cases"
   "--enable-vector"
   "--vector-field" "${VECTOR_FIELD}"
   "--vector-dim" "${VECTOR_DIM}"

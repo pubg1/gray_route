@@ -273,6 +273,9 @@ class OpenSearchImporter:
         try:
             use_ssl_flag = self._coerce_bool("use_ssl", use_ssl)
             verify_certs_flag = self._coerce_bool("verify_certs", verify_certs)
+            ssl_assert_hostname_flag = self._coerce_bool(
+                "ssl_assert_hostname", ssl_assert_hostname, default=True
+            )
             ssl_show_warn_flag = self._coerce_bool(
                 "ssl_show_warn", ssl_show_warn, default=True
             )
@@ -309,6 +312,7 @@ class OpenSearchImporter:
             "http_compress": True,
             "use_ssl": use_ssl_flag,
             "verify_certs": verify_certs_flag,
+            "ssl_assert_hostname": ssl_assert_hostname_flag,
             "ssl_show_warn": ssl_show_warn_flag,
             "timeout": timeout,
             "max_retries": 3,
@@ -355,6 +359,9 @@ class OpenSearchImporter:
         if isinstance(clone_target, str):
             clone_target = clone_target.strip()
         self.clone_source_index = clone_target or None
+        self.clone_source_index = (
+            clone_source_index.strip() if clone_source_index else None
+        )
         self.preserve_source_fields = preserve_flag
         self.recreate_index = recreate_flag
         self.embedder: Optional[Any] = None
@@ -721,6 +728,42 @@ class OpenSearchImporter:
             }
         }
 
+    def create_index_mapping(self, index_name: str) -> bool:
+        try:
+            response = self.client.indices.get_mapping(index=source_index)
+        except Exception as exc:
+            logger.warning("无法读取源索引 %s 的映射: %s", source_index, exc)
+            return None
+
+        mapping = response.get(source_index, {}).get("mappings")
+        if not mapping:
+            return None
+
+        return copy.deepcopy(mapping)
+
+    def _build_default_mapping(self) -> Dict[str, Any]:
+        return {
+            "mappings": {
+                "properties": {
+                    "id": {"type": "keyword"},
+                    "vehicletype": {
+                        "type": "text",
+                        "fields": {"keyword": {"type": "keyword"}},
+                    },
+                    "discussion": {"type": "text"},
+                    "symptoms": {"type": "text"},
+                    "solution": {"type": "text"},
+                    "search_content": {"type": "text"},
+                    "search_num": {"type": "integer"},
+                    "rate": {"type": "float"},
+                    "vin": {"type": "keyword"},
+                    "created_at": {"type": "date"},
+                    "source_index": {"type": "keyword"},
+                    "source_type": {"type": "keyword"},
+                }
+            }
+        }
+
     def _build_preserve_mapping(self) -> Dict[str, Any]:
         return {
             "mappings": {
@@ -771,6 +814,7 @@ class OpenSearchImporter:
                     body = self._build_preserve_mapping()
                 else:
                     body = self._build_default_mapping()
+                body = self._build_default_mapping()
 
             if self.enable_vector:
                 body.setdefault("settings", {})["index.knn"] = True
@@ -781,6 +825,19 @@ class OpenSearchImporter:
                     )
                 else:
                     properties[self.vector_field] = self._build_knn_field()
+                    properties[self.vector_field] = {
+                        "type": "knn_vector",
+                        "dimension": self.vector_dimension,
+                        "method": {
+                            "name": "hnsw",
+                            "space_type": "cosinesimil",
+                            "engine": "nmslib",
+                            "parameters": {
+                                "ef_construction": 128,
+                                "m": 16,
+                            },
+                        },
+                    }
 
             self.client.indices.create(index=index_name, body=body)
             logger.info("成功创建索引: %s", index_name)
@@ -971,6 +1028,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--clone-mapping-from",
         default=None,
         help="从指定索引克隆映射，保留所有原字段 (留空表示不克隆)",
+        default="automotive_cases",
+        help="从指定索引克隆映射，保留所有原字段",
     )
     parser.add_argument(
         "--preserve-source-fields",
