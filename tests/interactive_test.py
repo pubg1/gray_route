@@ -4,6 +4,12 @@
 交互式API测试工具
 """
 
+import pytest
+
+pytestmark = pytest.mark.skip(
+    reason="Interactive helper that requires running API service; skipped in automated tests."
+)
+
 import requests
 import json
 from typing import Dict, Any
