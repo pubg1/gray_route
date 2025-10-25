@@ -26,6 +26,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 DATA_FILE="${1:-${OPENSEARCH_DATA_FILE:-${ROOT_DIR}/data/servicingcase_last.json}}"
+ORIGINAL_DATA_FILE="${DATA_FILE}"
 
 if [[ ! -f "${DATA_FILE}" ]]; then
   echo "[错误] 数据文件不存在: ${DATA_FILE}" >&2
@@ -76,6 +77,13 @@ TIMEOUT_DEFAULT=$(read_config_value timeout)
 HOST=${OPENSEARCH_HOST:-${HOST_DEFAULT:-localhost}}
 PORT=${OPENSEARCH_PORT:-${PORT_DEFAULT:-9200}}
 INDEX=${OPENSEARCH_INDEX:-cases}
+if [[ -z "${OPENSEARCH_INDEX:-}" ]]; then
+  data_basename=$(basename "${ORIGINAL_DATA_FILE}")
+  data_lower=$(echo "${data_basename}" | tr 'A-Z' 'a-z')
+  if [[ "${data_lower}" == case_recovery.zip || "${data_lower}" == case_recovery.sql ]]; then
+    INDEX=cases_recovery
+  fi
+fi
 USERNAME=${OPENSEARCH_USERNAME:-${USERNAME_DEFAULT}}
 PASSWORD=${OPENSEARCH_PASSWORD:-${PASSWORD_DEFAULT}}
 SSL_FLAG=${OPENSEARCH_SSL:-${SSL_DEFAULT:-false}}
@@ -87,6 +95,32 @@ VECTOR_DIM=${OPENSEARCH_VECTOR_DIM:-512}
 EMBED_MODEL=${EMBEDDING_MODEL:-}
 MODEL_CACHE=${MODEL_CACHE_DIR:-}
 
+TEMP_JSON=""
+
+cleanup_temp() {
+  if [[ -n "${TEMP_JSON}" && -f "${TEMP_JSON}" ]]; then
+    rm -f "${TEMP_JSON}"
+  fi
+}
+
+shopt -s nocasematch
+if [[ "${DATA_FILE}" == *.zip ]]; then
+  TEMP_JSON=$(mktemp "${TMPDIR:-/tmp}/cases_import_XXXXXX.jsonl")
+  trap cleanup_temp EXIT
+  TABLE_ARGS=()
+  if [[ -n "${SQL_TABLES:-}" ]]; then
+    TABLE_ARGS=(--tables ${SQL_TABLES})
+  fi
+  echo "[信息] 检测到 ZIP 数据包，正在转换为 JSONL: ${DATA_FILE}" >&2
+  "${PYTHON_BIN}" "${SCRIPT_DIR}/convert_sql_to_jsonl.py" \
+    --zip "${DATA_FILE}" \
+    --output "${TEMP_JSON}" \
+    --index "${INDEX}" \
+    "${TABLE_ARGS[@]}"
+  DATA_FILE="${TEMP_JSON}"
+fi
+shopt -u nocasematch
+
 CMD=("${PYTHON_BIN}" "${SCRIPT_DIR}/import_to_opensearch.py"
   "--file" "${DATA_FILE}"
   "--index" "${INDEX}"
@@ -94,9 +128,12 @@ CMD=("${PYTHON_BIN}" "${SCRIPT_DIR}/import_to_opensearch.py"
   "--port" "${PORT}"
   "--timeout" "${TIMEOUT}"
   "--batch-size" "${BATCH_SIZE}"
+  "--clone-mapping-from" "automotive_cases"
   "--enable-vector"
   "--vector-field" "${VECTOR_FIELD}"
-  "--vector-dim" "${VECTOR_DIM}")
+  "--vector-dim" "${VECTOR_DIM}"
+  "--preserve-source-fields"
+  "--recreate-index")
 
 if [[ -n "${USERNAME}" && -n "${PASSWORD}" ]]; then
   CMD+=("--username" "${USERNAME}" "--password" "${PASSWORD}")
