@@ -494,6 +494,8 @@ def convert_zip_to_jsonl(
                     continue
 
                 row = dict(zip(statement.columns, statement.values))
+                if table_lower == "case_recovery":
+                    row = enrich_case_recovery_row(row)
                 stats[statement.table] += 1
                 doc_id = _determine_id(statement.columns, row, statement.table, stats[statement.table])
                 record = {"_source": row, "_id": doc_id}
@@ -576,7 +578,8 @@ discussion字段 -> 故障点
 import re
 import json
 import html
-from typing import List, Dict, Optional
+import math
+from typing import List, Dict, Optional, Any
 
 def clean_html_content(content: str) -> str:
     """清理HTML内容，提取纯文本"""
@@ -685,7 +688,32 @@ def extract_part_from_discussion(discussion: str) -> Optional[str]:
         part += "..."
     return part
 
-def calculate_popularity(symptoms: str, discussion: str, brand: str, system: str) -> int:
+def _parse_int(value: Optional[Any]) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return int(value)
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate:
+            return None
+        try:
+            return int(candidate)
+        except ValueError:
+            return None
+    return None
+
+
+def calculate_popularity(
+    symptoms: str,
+    discussion: str,
+    brand: str,
+    system: str,
+    *,
+    search_num: Optional[Any] = None,
+) -> int:
     """基于故障特征计算流行度分数"""
     base_score = 100
     content = (symptoms + " " + discussion).lower()
@@ -742,14 +770,24 @@ def calculate_popularity(symptoms: str, discussion: str, brand: str, system: str
     
     # 计算最终流行度
     popularity = int(base_score * brand_factor * system_factor * severity_factor * frequency_factor)
-    
+
     # 添加随机扰动，避免完全相同的分数
     import random
     random.seed(hash(symptoms + discussion) % 2147483647)  # 基于内容的固定种子
     popularity += random.randint(-10, 10)
-    
-    # 确保在合理范围内
-    return max(50, min(500, popularity))
+
+    popularity = max(50, min(500, popularity))
+
+    search_value = _parse_int(search_num)
+    if search_value is None:
+        return popularity
+
+    # 使用对数缩放，将 search_num 映射到 50-500 区间
+    scaled = int(20 + 40 * math.log1p(max(search_value, 0)))
+    scaled = max(50, min(500, scaled))
+
+    combined = int(round(0.6 * scaled + 0.4 * popularity))
+    return max(50, min(500, combined))
 
 def generate_tags_from_content(symptoms: str, discussion: str, brand: str) -> List[str]:
     """根据内容生成标签"""
@@ -785,8 +823,86 @@ def generate_tags_from_content(symptoms: str, discussion: str, brand: str) -> Li
         tags.append("故障诊断")
     
     tags.append("维修案例")
-    
+
     return tags[:5]  # 限制标签数量
+
+
+def enrich_case_recovery_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """补充 case_recovery 行的派生字段，确保包含 popularity 等关键信息"""
+
+    enriched: Dict[str, Any] = dict(row)
+
+    symptoms_source = (
+        enriched.get("symptoms")
+        or enriched.get("symptoms_raw")
+        or enriched.get("text")
+        or ""
+    )
+    discussion_source = (
+        enriched.get("discussion")
+        or enriched.get("discussion_raw")
+        or ""
+    )
+
+    symptoms_clean = clean_html_content(symptoms_source)
+    discussion_clean = clean_html_content(discussion_source)
+    brand = (enriched.get("vehiclebrand") or enriched.get("brand") or "").strip()
+
+    system_info = enriched.get("system")
+    if not system_info:
+        system_info = extract_system_from_discussion(discussion_clean) if discussion_clean else "其他"
+
+    part_info = enriched.get("part")
+    if not part_info:
+        part_info = extract_part_from_discussion(discussion_clean)
+    if not part_info:
+        part_info = enriched.get("vehicletype") or "未知部件"
+
+    tags_info = enriched.get("tags")
+    if not tags_info:
+        tags_info = generate_tags_from_content(symptoms_clean, discussion_clean, brand)
+
+    search_value = enriched.get("search_num")
+    if search_value is None:
+        search_value = enriched.get("searchNum")
+
+    popularity_score = calculate_popularity(
+        symptoms_clean,
+        discussion_clean,
+        brand,
+        system_info,
+        search_num=search_value,
+    )
+
+    search_content_raw = enriched.get("search") or enriched.get("search_content") or ""
+    search_content_clean = clean_html_content(search_content_raw)
+
+    # 更新字段
+    enriched["symptoms"] = symptoms_clean
+    enriched["discussion"] = discussion_clean
+    enriched["text"] = symptoms_clean
+    enriched["system"] = system_info
+    enriched["part"] = part_info
+    enriched["tags"] = tags_info
+    enriched["popularity"] = popularity_score
+    if search_content_clean:
+        enriched["search_content"] = search_content_clean
+
+    parsed_search_num = _parse_int(search_value)
+    if parsed_search_num is not None:
+        enriched["search_num"] = parsed_search_num
+
+    if brand:
+        enriched.setdefault("brand", brand)
+
+    case_id = enriched.get("id") or enriched.get("case_id")
+    if case_id:
+        enriched.setdefault("case_id", case_id)
+
+    enriched.pop("symptoms_raw", None)
+    enriched.pop("discussion_raw", None)
+
+    return enriched
 
 def clean_sql_value(value: str) -> Optional[str]:
     """清理SQL值，移除引号并处理NULL"""
@@ -844,30 +960,62 @@ def convert_sql_to_jsonl(sql_file_path: str, output_file_path: str):
                 topic = clean_sql_value(fields[7]) if len(fields) > 7 else None
                 
                 if symptoms and discussion:
-                    # 清理HTML内容
-                    symptoms_clean = clean_html_content(symptoms)
-                    discussion_clean = clean_html_content(discussion)
-                    
-                    if symptoms_clean and discussion_clean and len(symptoms_clean) > 5:
-                        # 从discussion中提取系统信息（通常在开头）
-                        system_info = extract_system_from_discussion(discussion_clean)
-                        part_info = extract_part_from_discussion(discussion_clean)
-                        tags_info = generate_tags_from_content(symptoms_clean, discussion_clean, vehiclebrand)
-                        popularity_score = calculate_popularity(symptoms_clean, discussion_clean, vehiclebrand or "", system_info)
-                        
-                        # 创建JSONL记录，格式参考phenomena_sample.jsonl
+                    search_content = clean_sql_value(fields[9]) if len(fields) > 9 else None
+                    solution = clean_sql_value(fields[10]) if len(fields) > 10 else None
+                    summary = clean_sql_value(fields[11]) if len(fields) > 11 else None
+                    search_num = clean_sql_value(fields[25]) if len(fields) > 25 else None
+
+                    raw_row = {
+                        "id": clean_sql_value(fields[0]) if len(fields) > 0 else None,
+                        "symptoms_raw": symptoms,
+                        "discussion_raw": discussion,
+                        "vehiclebrand": vehiclebrand,
+                        "vehicletype": vehicletype,
+                        "topic": topic,
+                        "search": search_content,
+                        "solution": solution,
+                        "summary": summary,
+                        "search_num": search_num,
+                    }
+
+                    enriched = enrich_case_recovery_row(raw_row)
+                    text_value = enriched.get("text")
+                    discussion_value = enriched.get("discussion")
+
+                    if text_value and discussion_value and len(text_value) > 5:
                         record = {
                             "id": f"C{record_id:04d}",
-                            "text": symptoms_clean,  # 故障现象
-                            "system": system_info,  # 故障系统
-                            "part": part_info or vehicletype or "未知部件",  # 故障部件
-                            "tags": tags_info,
-                            "popularity": popularity_score  # 基于特征的流行度计算
+                            "case_id": raw_row.get("id"),
+                            "text": text_value,
+                            "system": enriched.get("system"),
+                            "part": enriched.get("part"),
+                            "tags": enriched.get("tags", []),
+                            "popularity": enriched.get("popularity", 0),
                         }
-                        
+
+                        if enriched.get("search_content"):
+                            record["search_content"] = enriched["search_content"]
+                        if discussion_value:
+                            record["discussion"] = discussion_value
+                        if enriched.get("symptoms"):
+                            record["symptoms"] = enriched["symptoms"]
+                        if vehiclebrand:
+                            record["brand"] = vehiclebrand
+                        if vehicletype:
+                            record["vehicle_type"] = vehicletype
+                        if topic:
+                            record["topic"] = topic
+                        if solution:
+                            record["solution"] = clean_html_content(solution)
+                        if summary:
+                            record["summary"] = clean_html_content(summary)
+                        search_num_value = enriched.get("search_num")
+                        if search_num_value is not None:
+                            record["search_num"] = search_num_value
+
                         jsonl_data.append(record)
                         record_id += 1
-                        
+
                         if record_id % 100 == 0:
                             print(f"已处理 {record_id-1} 条记录...")
             
