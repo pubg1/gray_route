@@ -109,6 +109,9 @@ python import_to_opensearch.py -f ../data/servicingcase_last.json -i automotive_
 | `search_content` | text | 完整搜索内容 |
 | `search_num` | integer | 搜索次数 |
 | `created_at` | date | 创建时间 |
+| `text_vector`* | knn_vector | 语义检索向量 (可选) |
+
+> \* 仅在执行脚本时添加 `--enable-vector` 时创建，该字段使用 `knn_vector` 类型并开启 `index.knn`。
 
 ### 命令行参数
 
@@ -126,6 +129,10 @@ python import_to_opensearch.py [选项]
   -p, --password PASS  密码
   --ssl                使用SSL连接
   --batch-size SIZE    批量导入大小 (默认: 100)
+  --enable-vector      写入语义向量并启用kNN索引配置
+  --vector-field NAME  向量字段名称 (默认: text_vector)
+  --vector-dim DIM     向量维度 (默认: 512)
+  --embedding-model ID 自定义SentenceTransformer模型 (默认复用app.embedding配置)
   --test               导入后进行搜索测试
 ```
 
@@ -149,6 +156,13 @@ python import_to_opensearch.py \
   -f ../data/servicingcase_last.json \
   --batch-size 500 \
   --test
+
+# 启用语义向量写入，构建kNN索引
+python import_to_opensearch.py \
+  -f ../data/servicingcase_last.json \
+  --enable-vector \
+  --vector-field text_vector \
+  --vector-dim 512
 ```
 
 ## 搜索测试
