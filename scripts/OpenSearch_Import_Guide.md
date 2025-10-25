@@ -133,6 +133,7 @@ python import_to_opensearch.py [选项]
   --vector-field NAME  向量字段名称 (默认: text_vector)
   --vector-dim DIM     向量维度 (默认: 512)
   --embedding-model ID 自定义SentenceTransformer模型 (默认复用app.embedding配置)
+  --model-cache PATH   预下载/缓存embedding模型的目录
   --test               导入后进行搜索测试
 ```
 
@@ -171,8 +172,9 @@ python import_to_opensearch.py \
 
 运行导入脚本时会自动尝试下载并缓存所需的模型：
 
-* 如果环境已安装 `huggingface_hub`，脚本会在导入前调用 `snapshot_download` 预拉取模型文件。可通过设置 `SENTENCE_TRANSFORMERS_HOME` 或 `HF_HOME` 环境变量自定义缓存目录。
-* 若未安装 `huggingface_hub`，则由 `SentenceTransformer` 在首次加载时自动下载到默认缓存目录（通常是 `~/.cache/huggingface`）。
+* 如果环境已安装 `huggingface_hub`，脚本会在导入前调用 `snapshot_download` 预拉取模型文件。可通过 `--model-cache` 或设置 `SENTENCE_TRANSFORMERS_HOME`/`HF_HOME` 环境变量自定义缓存目录。
+* 若未安装 `huggingface_hub`，则由 `SentenceTransformer` 在首次加载时自动下载到默认缓存目录（通常是 `~/.cache/huggingface`），同样会复用 `--model-cache` 设置的目录。
+* 如需访问私有模型，可提前在环境变量中设置 `HF_TOKEN`、`HUGGINGFACE_TOKEN` 或 `HUGGINGFACEHUB_API_TOKEN`，脚本会在预下载时自动使用。
 
 > **提示**：如果你的环境无法联网，可提前在有网络的机器上下载模型，然后拷贝到离线环境的 `~/.cache/huggingface` 或者自定义的 `SENTENCE_TRANSFORMERS_HOME` 目录。
 
@@ -202,7 +204,7 @@ python import_to_opensearch.py \
 
 ```bash
 export EMBEDDING_MODEL="moka-ai/m3e-base"
-python import_to_opensearch.py -f ../data/servicingcase_last.json --enable-vector
+python import_to_opensearch.py -f ../data/servicingcase_last.json --enable-vector --model-cache /data/hf-cache
 ```
 
 选择模型时请确保输出向量维度与 `--vector-dim` 参数一致（常见中文模型如 `bge-small-zh` 为 512 维，`bge-base-zh` 为 768 维）。

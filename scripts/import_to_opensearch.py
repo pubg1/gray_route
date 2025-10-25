@@ -66,7 +66,8 @@ class OpenSearchImporter:
                  enable_vector: bool = False,
                  vector_field: str = 'text_vector',
                  vector_dimension: int = 512,
-                 embedding_model: Optional[str] = None):
+                 embedding_model: Optional[str] = None,
+                 model_cache_dir: Optional[str] = None):
         """初始化 OpenSearch 连接"""
         
         # 处理 AWS VPC 端点 URL
@@ -103,11 +104,16 @@ class OpenSearchImporter:
         self.vector_field = vector_field if vector_field else None
         self.vector_dimension = vector_dimension
         self.embedding_model = embedding_model
+        self.model_cache_dir = model_cache_dir.strip() if model_cache_dir else None
         self.embedder = None
+        self._prepared_model_path: Optional[str] = None
 
         if self.enable_vector and not self.vector_field:
             logger.warning("未指定向量字段名称，已禁用语义向量写入功能")
             self.enable_vector = False
+
+        if self.model_cache_dir:
+            self._configure_model_cache_env()
 
         if self.enable_vector and self.vector_field:
             self.embedder = self._load_embedder()
@@ -197,8 +203,8 @@ class OpenSearchImporter:
     def _load_embedder(self):
         """加载向量模型"""
         model_id = self._infer_model_id()
+        local_path = self._ensure_model_download(model_id)
         if SentenceTransformer is not None:
-            local_path = self._ensure_model_download(model_id)
             load_target = local_path or model_id
             try:
                 model = SentenceTransformer(load_target, trust_remote_code=True)
@@ -240,20 +246,50 @@ class OpenSearchImporter:
 
         return "BAAI/bge-small-zh-v1.5"
 
+    def _configure_model_cache_env(self) -> None:
+        cache_root = os.path.abspath(self.model_cache_dir)
+        self.model_cache_dir = cache_root
+        os.makedirs(cache_root, exist_ok=True)
+        for env_key in ("SENTENCE_TRANSFORMERS_HOME", "HF_HOME"):
+            if not os.environ.get(env_key):
+                os.environ[env_key] = cache_root
+        logger.info("已将 embedding 模型缓存目录设置为: %s", cache_root)
+
     def _ensure_model_download(self, model_id: str) -> Optional[str]:
+        if self._prepared_model_path:
+            return self._prepared_model_path
+
         if snapshot_download is None:
             logger.debug("huggingface_hub 未安装，跳过模型预下载")
             return None
 
         try:
             download_kwargs = {"repo_id": model_id, "local_dir_use_symlinks": False}
-            preferred_home = os.environ.get("SENTENCE_TRANSFORMERS_HOME") or os.environ.get("HF_HOME")
-            if preferred_home:
-                target_dir = os.path.join(preferred_home, os.path.basename(model_id))
+            cache_root = (
+                self.model_cache_dir
+                or os.environ.get("SENTENCE_TRANSFORMERS_HOME")
+                or os.environ.get("HF_HOME")
+            )
+            target_dir = None
+            if cache_root:
+                cache_root = os.path.abspath(cache_root)
+                os.makedirs(cache_root, exist_ok=True)
+                sanitized = model_id.replace("/", "--")
+                target_dir = os.path.join(cache_root, sanitized)
                 os.makedirs(target_dir, exist_ok=True)
                 download_kwargs["local_dir"] = target_dir
+
+            token = (
+                os.environ.get("HF_TOKEN")
+                or os.environ.get("HUGGINGFACE_TOKEN")
+                or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
+            )
+            if token:
+                download_kwargs["token"] = token
+
             local_path = snapshot_download(**download_kwargs)
             logger.info("embedding 模型已准备就绪: %s", local_path)
+            self._prepared_model_path = local_path
             return local_path
         except Exception as download_err:
             logger.warning("预下载 embedding 模型失败: %s", download_err)
@@ -531,6 +567,7 @@ def main():
     parser.add_argument('--vector-field', default='text_vector', help='向量字段名称 (默认: text_vector)')
     parser.add_argument('--vector-dim', type=int, default=512, help='向量维度 (默认: 512)')
     parser.add_argument('--embedding-model', help='自定义 SentenceTransformer 模型名称')
+    parser.add_argument('--model-cache', help='自定义 embedding 模型缓存目录')
     parser.add_argument('--test', action='store_true', help='导入后进行搜索测试')
 
     args = parser.parse_args()
@@ -547,6 +584,7 @@ def main():
             vector_field=args.vector_field,
             vector_dimension=args.vector_dim,
             embedding_model=args.embedding_model,
+            model_cache_dir=args.model_cache,
         )
         
         # 导入数据
