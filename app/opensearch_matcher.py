@@ -399,6 +399,169 @@ class OpenSearchMatcher:
                 "top": [],
                 "error": str(e)
             }
+
+    def search_fault_points(
+        self,
+        vehicle_brand: Optional[str] = None,
+        vehicle_name: Optional[str] = None,
+        model_year: Optional[str] = None,
+        fault_code: Optional[str] = None,
+        control_unit: Optional[str] = None,
+        symptom: Optional[str] = None,
+        size: int = 5,
+    ) -> Dict:
+        """根据车辆信息和故障现象，检索 discussion 字段中的故障点说明"""
+
+        try:
+            must_clauses: List[Dict[str, Any]] = []
+            should_clauses: List[Dict[str, Any]] = []
+
+            if vehicle_brand:
+                must_clauses.append({"match": {"vehiclebrand": vehicle_brand}})
+
+            if vehicle_name:
+                must_clauses.append({
+                    "multi_match": {
+                        "query": vehicle_name,
+                        "fields": [
+                            "vehicletype^2.0",
+                            "topic^1.5",
+                            "symptoms",
+                            "searchContent",
+                            "search_content",
+                        ],
+                        "type": "best_fields",
+                    }
+                })
+
+            if model_year:
+                year_should = []
+                for field in ["modelyear", "spare1", "spare15", "year", "vehicletype"]:
+                    year_should.append({"match_phrase": {field: model_year}})
+                must_clauses.append({
+                    "bool": {
+                        "should": year_should,
+                        "minimum_should_match": 1,
+                    }
+                })
+
+            if control_unit:
+                must_clauses.append({
+                    "multi_match": {
+                        "query": control_unit,
+                        "fields": [
+                            "part^2.0",
+                            "system^1.5",
+                            "discussion^1.2",
+                            "spare2",
+                            "spare1",
+                        ],
+                        "type": "best_fields",
+                    }
+                })
+
+            if symptom:
+                must_clauses.append({
+                    "multi_match": {
+                        "query": symptom,
+                        "fields": [
+                            "discussion^3.0",
+                            "symptoms^2.5",
+                            "text^2.0",
+                            "topic^1.5",
+                            "solution",
+                        ],
+                        "type": "best_fields",
+                        "fuzziness": "AUTO",
+                        "minimum_should_match": "70%",
+                    }
+                })
+
+            if fault_code:
+                should_clauses.extend([
+                    {"match_phrase": {"faultcode": fault_code}},
+                    {"match_phrase": {"spare4": fault_code}},
+                ])
+
+            if not must_clauses:
+                must_clauses.append({"match_all": {}})
+
+            bool_query: Dict[str, Any] = {
+                "must": must_clauses,
+            }
+            if should_clauses:
+                bool_query["should"] = should_clauses
+                bool_query["minimum_should_match"] = 1
+
+            search_body: Dict[str, Any] = {
+                "query": {"bool": bool_query},
+                "size": max(1, size),
+                "highlight": {
+                    "fields": {
+                        "discussion": {
+                            "fragment_size": 150,
+                            "number_of_fragments": 1,
+                            "pre_tags": ["<mark>"],
+                            "post_tags": ["</mark>"],
+                        }
+                    }
+                },
+                "_source": [
+                    "discussion",
+                    "vehiclebrand",
+                    "vehicletype",
+                    "modelyear",
+                    "system",
+                    "part",
+                    "faultcode",
+                    "spare4",
+                ],
+            }
+
+            response = self.client.search(
+                index=INDEX_CONFIG['name'],
+                body=search_body,
+                size=max(1, size)
+            )
+
+            fault_points: List[Dict[str, Any]] = []
+            for hit in response.get('hits', {}).get('hits', []):
+                doc_id, source = self._extract_source(hit)
+                highlight = hit.get('highlight', {}).get('discussion') or []
+                fault_points.append({
+                    "id": doc_id,
+                    "score": float(hit.get('_score') or 0.0),
+                    "discussion": source.get('discussion', ''),
+                    "highlight": highlight[0] if highlight else None,
+                    "vehiclebrand": source.get('vehiclebrand'),
+                    "vehicletype": source.get('vehicletype'),
+                    "modelyear": source.get('modelyear') or source.get('spare1'),
+                    "system": source.get('system'),
+                    "part": source.get('part'),
+                    "faultcode": source.get('faultcode') or source.get('spare4'),
+                })
+
+            return {
+                "total": response.get('hits', {}).get('total', {}).get('value', 0),
+                "fault_points": fault_points,
+                "request": {
+                    "vehicle_brand": vehicle_brand,
+                    "vehicle_name": vehicle_name,
+                    "model_year": model_year,
+                    "fault_code": fault_code,
+                    "control_unit": control_unit,
+                    "symptom": symptom,
+                    "size": max(1, size),
+                }
+            }
+
+        except Exception as e:
+            logger.error(f"故障点检索失败: {e}")
+            return {
+                "total": 0,
+                "fault_points": [],
+                "error": str(e),
+            }
     def _generate_base_decision(
         self,
         search_result: Dict,

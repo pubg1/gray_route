@@ -170,6 +170,16 @@ class OpenSearchRequest(BaseModel):
     use_llm: bool = False
     llm_topn: int = 5
 
+
+class FaultPointRequest(BaseModel):
+    vehicle_brand: Optional[str] = None
+    vehicle_name: Optional[str] = None
+    model_year: Optional[str] = None
+    fault_code: Optional[str] = None
+    control_unit: Optional[str] = None
+    symptom: Optional[str] = None
+    size: int = 5
+
 @app.post("/opensearch/match")
 async def opensearch_match(request: OpenSearchRequest):
     """基于 OpenSearch 的故障现象匹配"""
@@ -229,12 +239,54 @@ async def opensearch_stats():
     """获取 OpenSearch 索引统计信息"""
     if not OPENSEARCH_AVAILABLE:
         return {"error": "OpenSearch 不可用"}
-    
+
     try:
         return opensearch_matcher.get_statistics()
     except Exception as e:
         logger.error(f"获取 OpenSearch 统计信息失败: {e}")
         return {"error": str(e)}
+
+
+@app.post("/opensearch/fault-points")
+async def opensearch_fault_points(request: FaultPointRequest):
+    """根据车辆信息检索故障点说明"""
+    if not OPENSEARCH_AVAILABLE:
+        return {
+            "error": "OpenSearch 不可用",
+            "message": "请确保 OpenSearch 服务已启动"
+        }
+
+    if not any([
+        request.vehicle_brand,
+        request.vehicle_name,
+        request.model_year,
+        request.fault_code,
+        request.control_unit,
+        request.symptom,
+    ]):
+        return {
+            "error": "缺少查询条件",
+            "message": "请至少提供一个查询字段"
+        }
+
+    try:
+        result = await asyncio.to_thread(
+            opensearch_matcher.search_fault_points,
+            vehicle_brand=request.vehicle_brand,
+            vehicle_name=request.vehicle_name,
+            model_year=request.model_year,
+            fault_code=request.fault_code,
+            control_unit=request.control_unit,
+            symptom=request.symptom,
+            size=request.size,
+        )
+        return result
+    except Exception as e:
+        logger.error(f"故障点检索失败: {e}")
+        return {
+            "error": "故障点检索失败",
+            "message": str(e)
+        }
 
 @app.get("/match/hybrid")
 async def hybrid_match(

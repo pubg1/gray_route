@@ -13,11 +13,16 @@
     header h1 { margin:0; font-size:20px; letter-spacing: .3px; }
     header .badge { padding:4px 8px; border-radius: 999px; background: #203055; color:#b7cdfb; font-size:12px; }
     .panel { background: rgba(20,27,45,.9); border:1px solid #2a3a63; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,.25); overflow: hidden; }
+    .fault-panel { margin-top: 24px; }
     .form { display:grid; grid-template-columns: 1fr 140px 140px 140px 120px 100px 100px; gap:10px; padding:16px; border-bottom:1px dashed #2a3a63; }
+    .fault-form { display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:10px; padding:16px; border-bottom:1px dashed #2a3a63; }
     .form input, .form select, .form button { height:38px; border-radius:10px; border:1px solid #33446f; background:#0f1527; color:var(--text); padding:0 12px; outline:none; }
+    .fault-form input, .fault-form select, .fault-form button { height:38px; border-radius:10px; border:1px solid #33446f; background:#0f1527; color:var(--text); padding:0 12px; outline:none; }
     .form input::placeholder { color:#98a3bf80; }
     .form button { background: linear-gradient(180deg, #2a63ff, #2052d6); border:0; font-weight:600; cursor:pointer; }
+    .fault-form button { background: linear-gradient(180deg, #2a63ff, #2052d6); border:0; font-weight:600; cursor:pointer; }
     .form button.secondary { background:#0f1527; border:1px solid #2a3a63; }
+    .fault-form button.secondary { background:#0f1527; border:1px solid #2a3a63; }
     .options { display:flex; flex-wrap:wrap; gap:16px; padding:12px 16px; border-bottom:1px dashed #2a3a63; background:rgba(11,17,32,0.35); }
     .options label { display:flex; align-items:center; gap:8px; color:#c5d4ff; font-size:13px; }
     .options input[type="checkbox"] { width:16px; height:16px; accent-color:#4f8cff; }
@@ -44,6 +49,17 @@
     details { padding: 0 16px 16px; }
     pre { white-space: pre-wrap; word-break: break-word; background: #0b1020; padding: 12px; border-radius: 10px; border:1px solid #2a3a63; }
     .footer { text-align:center; color:#8b97b6; margin-top:16px; font-size:12px; }
+    .fault-header { display:flex; align-items:center; justify-content:space-between; padding:16px; border-bottom:1px dashed #2a3a63; }
+    .fault-header h2 { margin:0; font-size:18px; }
+    .fault-meta { padding:12px 16px; color:#a9b7d9; font-size:13px; border-bottom:1px dashed #2a3a63; }
+    .fault-results { display:grid; grid-template-columns: 1fr; gap:10px; padding:16px; }
+    @media (min-width: 860px) { .fault-results { grid-template-columns: 1fr 1fr; } }
+    .fault-card { padding:14px; border:1px solid #2a3a63; border-radius:12px; background:#0e1426; display:flex; flex-direction:column; gap:8px; }
+    .fault-card h3 { margin:0; font-size:16px; color:#9fb6f9; }
+    .fault-card .score { align-self:flex-start; padding:2px 10px; border-radius:999px; background:#152247; font-size:12px; color:#6aa6ff; }
+    .fault-card .meta-line { font-size:12px; color:#94a3b8; }
+    .fault-card .discussion { font-size:14px; line-height:1.6; color:#e2e8f0; }
+    .fault-empty { padding:20px; color:#7e8aa6; font-size:14px; }
   </style>
 </head>
 <body>
@@ -106,6 +122,35 @@
       </details>
     </div>
 
+    <div class="panel fault-panel">
+      <div class="fault-header">
+        <h2>故障点检索（discussion 字段）</h2>
+        <span class="badge" id="fault-total">未查询</span>
+      </div>
+
+      <form id="fault-form" class="fault-form" onsubmit="return false;">
+        <input id="fp_brand" placeholder="车辆品牌，如：别克" />
+        <input id="fp_name" placeholder="车型名称，如：昂科威" />
+        <input id="fp_year" placeholder="年份，如：2021" />
+        <input id="fp_code" placeholder="故障码，如：P0300" />
+        <input id="fp_unit" placeholder="损坏控制单元，如：发动机控制模块" />
+        <input id="fp_symptom" placeholder="故障现象，如：加速无力" />
+        <select id="fp_size">
+          <option value="3">返回 3 条</option>
+          <option value="5" selected>返回 5 条</option>
+          <option value="8">返回 8 条</option>
+          <option value="10">返回 10 条</option>
+        </select>
+        <div style="display:flex; gap:8px;">
+          <button id="fault-run">检索</button>
+          <button id="fault-reset" type="button" class="secondary">清空</button>
+        </div>
+      </form>
+
+      <div class="fault-meta" id="fault-meta">请至少填写一个条件后再检索。</div>
+      <div class="fault-results" id="fault-results"></div>
+    </div>
+
     <div class="footer">基于 AWS OpenSearch 的多字段匹配 + BM25 算法 + 故障现象智能匹配</div>
   </div>
 
@@ -154,6 +199,19 @@
     const llmTopn = document.getElementById('llm_topn');
     const llmMode = document.getElementById('llm-mode');
 
+    const faultBrand = document.getElementById('fp_brand');
+    const faultName = document.getElementById('fp_name');
+    const faultYear = document.getElementById('fp_year');
+    const faultCode = document.getElementById('fp_code');
+    const faultUnit = document.getElementById('fp_unit');
+    const faultSymptom = document.getElementById('fp_symptom');
+    const faultSize = document.getElementById('fp_size');
+    const faultRunBtn = document.getElementById('fault-run');
+    const faultResetBtn = document.getElementById('fault-reset');
+    const faultResults = document.getElementById('fault-results');
+    const faultMeta = document.getElementById('fault-meta');
+    const faultTotal = document.getElementById('fault-total');
+
     runBtn.addEventListener('click', runQuery);
     semanticWeight.addEventListener('input', ()=>{
       semanticWeightValue.textContent = Number(semanticWeight.value).toFixed(2);
@@ -174,6 +232,10 @@
       semanticMode.textContent = "-";
       llmMode.textContent = "-";
     });
+
+    faultRunBtn.addEventListener('click', runFaultQuery);
+    document.getElementById('fault-form').addEventListener('submit', runFaultQuery);
+    faultResetBtn.addEventListener('click', resetFaultForm);
 
     function setLatency(ms){
       document.getElementById('latency').textContent = ms==null ? "-" : ms.toFixed(0);
@@ -216,6 +278,23 @@
         html = html.replace(re, m=>`<mark>${m}</mark>`);
       });
       return html;
+    }
+
+    function sanitizeHighlight(raw){
+      if (!raw) return '';
+      const template = document.createElement('template');
+      template.innerHTML = raw;
+      template.content.querySelectorAll('*').forEach(node=>{
+        if (node.tagName && node.tagName.toLowerCase() === 'mark') return;
+        if (node.tagName && node.tagName.toLowerCase() === 'script') {
+          node.remove();
+          return;
+        }
+        const span = document.createElement('span');
+        span.textContent = node.outerHTML;
+        node.replaceWith(span);
+      });
+      return template.innerHTML;
     }
 
     async function runQuery(){
@@ -322,6 +401,110 @@
         document.getElementById('raw').textContent = String(err);
         semanticMode.textContent = "错误";
         llmMode.textContent = "错误";
+      }
+    }
+
+    function resetFaultForm(){
+      faultBrand.value = "";
+      faultName.value = "";
+      faultYear.value = "";
+      faultCode.value = "";
+      faultUnit.value = "";
+      faultSymptom.value = "";
+      faultSize.value = "5";
+      faultResults.innerHTML = "";
+      faultMeta.textContent = "请至少填写一个条件后再检索。";
+      faultTotal.textContent = "未查询";
+    }
+
+    async function runFaultQuery(evt){
+      if (evt) evt.preventDefault();
+
+      const payload = { size: parseInt(faultSize.value, 10) || 5 };
+      const fieldMap = [
+        ['vehicle_brand', faultBrand.value.trim()],
+        ['vehicle_name', faultName.value.trim()],
+        ['model_year', faultYear.value.trim()],
+        ['fault_code', faultCode.value.trim()],
+        ['control_unit', faultUnit.value.trim()],
+        ['symptom', faultSymptom.value.trim()],
+      ];
+
+      let hasCondition = false;
+      fieldMap.forEach(([key, val])=>{
+        if (val) {
+          payload[key] = val;
+          hasCondition = true;
+        }
+      });
+
+      if (!hasCondition) {
+        faultMeta.textContent = "请至少填写一个条件后再检索。";
+        faultTotal.textContent = "未查询";
+        return;
+      }
+
+      faultMeta.textContent = "检索中...";
+      faultTotal.textContent = "检索中";
+      faultResults.innerHTML = "";
+
+      try {
+        const resp = await fetch(API_BASE + '/opensearch/fault-points', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+
+        if (data.error) {
+          faultMeta.textContent = data.message || data.error || '查询失败';
+          faultTotal.textContent = '错误';
+          return;
+        }
+
+        const list = data.fault_points || [];
+        faultTotal.textContent = `${list.length} / ${data.total ?? 0}`;
+        if (!list.length) {
+          faultMeta.textContent = '未检索到匹配的故障点，请调整条件重试。';
+          faultResults.innerHTML = '<div class="fault-empty">暂无数据</div>';
+          return;
+        }
+
+        faultMeta.textContent = `共 ${data.total ?? list.length} 条匹配，展示 ${list.length} 条故障点。`;
+        faultResults.innerHTML = '';
+
+        const highlightQuery = [payload.symptom, payload.control_unit].filter(Boolean).join(' ');
+
+        list.forEach(item => {
+          const card = document.createElement('div');
+          card.className = 'fault-card';
+          const titleParts = [item.vehiclebrand, item.vehicletype, item.modelyear].filter(Boolean);
+          const title = titleParts.length ? titleParts.join(' / ') : '未知车型';
+          const systemLine = [
+            item.system ? `系统：${escHTML(item.system)}` : '',
+            item.part ? `部件：${escHTML(item.part)}` : ''
+          ].filter(Boolean).join(' ｜ ');
+          const codeLine = item.faultcode ? `故障码：${escHTML(item.faultcode)}` : '';
+          const discussionHTML = item.highlight ? sanitizeHighlight(item.highlight) : highlight(item.discussion || '', highlightQuery);
+
+          card.innerHTML = `
+            <span class="score">得分 ${Number(item.score || 0).toFixed(2)}</span>
+            <h3>${escHTML(title)}</h3>
+            ${systemLine ? `<div class="meta-line">${systemLine}</div>` : ''}
+            ${codeLine ? `<div class="meta-line">${codeLine}</div>` : ''}
+            <div class="discussion">${discussionHTML || '暂无故障点描述'}</div>
+          `;
+
+          faultResults.appendChild(card);
+        });
+
+      } catch (err) {
+        faultMeta.textContent = '请求失败：' + err;
+        faultTotal.textContent = '错误';
+        faultResults.innerHTML = '';
       }
     }
   </script>
