@@ -148,6 +148,7 @@
       </form>
 
       <div class="fault-meta" id="fault-meta">请至少填写一个条件后再检索。</div>
+      <div class="examples" id="fault-examples"></div>
       <div class="fault-results" id="fault-results"></div>
     </div>
 
@@ -211,6 +212,32 @@
     const faultResults = document.getElementById('fault-results');
     const faultMeta = document.getElementById('fault-meta');
     const faultTotal = document.getElementById('fault-total');
+    const faultExamplesWrap = document.getElementById('fault-examples');
+
+    const FAULT_EXAMPLES = [
+      { brand: '别克', name: '昂科威', year: '2021', code: 'P0014', unit: '发动机控制模块', symptom: '发动机动力不足' },
+      { brand: '凯迪拉克', name: 'CT5', year: '2020', code: 'P0300', unit: '点火系统', symptom: '怠速抖动' },
+      { brand: '雪佛兰', name: '探界者', year: '2019', code: 'C0040', unit: 'ABS控制模块', symptom: '制动踏板震动' },
+      { brand: '别克', name: 'GL8', year: '2022', code: 'U0100', unit: '车身控制模块', symptom: '仪表盘报警灯常亮' },
+    ];
+
+    FAULT_EXAMPLES.forEach(example => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      const title = [example.brand, example.name, example.year].filter(Boolean).join(' ');
+      const faultLabel = example.symptom ? `｜${example.symptom}` : '';
+      button.textContent = `${title}${faultLabel}`;
+      button.onclick = () => {
+        faultBrand.value = example.brand || '';
+        faultName.value = example.name || '';
+        faultYear.value = example.year || '';
+        faultCode.value = example.code || '';
+        faultUnit.value = example.unit || '';
+        faultSymptom.value = example.symptom || '';
+        runFaultQuery();
+      };
+      faultExamplesWrap.appendChild(button);
+    });
 
     runBtn.addEventListener('click', runQuery);
     semanticWeight.addEventListener('input', ()=>{
