@@ -15,14 +15,16 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import logging
+import math
 import os
 import re
 import sys
 from collections import Counter
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 from zipfile import ZipFile
 
 LOGGER = logging.getLogger(__name__)
@@ -1121,8 +1123,10 @@ def parse_sql_values_simple(values_str: str) -> List[str]:
     
     return fields
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - CLI 入口
+    if len(sys.argv) > 1:
+        sys.exit(main())
+
     sql_file = "case_recovery.sql"
     output_file = "case_recovery_phenomena.jsonl"
-    
     convert_sql_to_jsonl(sql_file, output_file)
