@@ -1,26 +1,37 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-将 servicingcase_last.json 数据导入 OpenSearch
+"""将 servicingcase_last.json 数据导入 OpenSearch。
+
+该脚本支持：
+* 将原始 JSON 行数据转换成应用所需字段结构；
+* 按批次写入 OpenSearch；
+* 可选地启用 `knn_vector` 字段写入，并在需要时自动准备 embedding 模型。
+
+脚本尽可能复用应用内部的 embedding 加载逻辑，同时在缺少依赖时优雅回退。
 """
 
+from __future__ import annotations
+
+import argparse
+import importlib
+import importlib.util
 import json
+import logging
 import os
 import re
-import importlib
-from typing import Dict, List, Any, Optional, Tuple
-from opensearchpy import OpenSearch
-from opensearchpy.helpers import bulk
-import argparse
 import sys
 from datetime import datetime
-import logging
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-# 为了复用应用内的向量模型工具，确保可以导入 app 模块
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+from opensearchpy import OpenSearch
+from opensearchpy.helpers import bulk
+
+# 为了能够复用 app 内部的工具，将项目根目录加入 sys.path
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
+# 尝试加载应用内的 embedding 与配置模块（若缺失则在运行期回退）
 embedding_spec = importlib.util.find_spec("app.embedding")
 if embedding_spec is not None:
     embedding_module = importlib.import_module("app.embedding")
@@ -28,377 +39,415 @@ if embedding_spec is not None:
 else:  # pragma: no cover - 离线导入脚本允许缺省模型
     get_embedder = None
 
+config_spec = importlib.util.find_spec("app.config")
+if config_spec is not None:
+    config_module = importlib.import_module("app.config")
+    get_settings = getattr(config_module, "get_settings", None)
+else:  # pragma: no cover - 命令行导入可脱离应用运行
+    get_settings = None
+
 sentence_spec = importlib.util.find_spec("sentence_transformers")
 if sentence_spec is not None:
     sentence_module = importlib.import_module("sentence_transformers")
     SentenceTransformer = getattr(sentence_module, "SentenceTransformer", None)
-else:  # pragma: no cover - 仅用于命令行导入
+else:  # pragma: no cover - sentence-transformers 为可选依赖
     SentenceTransformer = None
 
-huggingface_spec = importlib.util.find_spec("huggingface_hub")
-if huggingface_spec is not None:
-    huggingface_module = importlib.import_module("huggingface_hub")
-    snapshot_download = getattr(huggingface_module, "snapshot_download", None)
-else:  # pragma: no cover - huggingface_hub 为可选依赖
+hf_spec = importlib.util.find_spec("huggingface_hub")
+if hf_spec is not None:
+    hf_module = importlib.import_module("huggingface_hub")
+    snapshot_download = getattr(hf_module, "snapshot_download", None)
+else:  # pragma: no cover - huggingface_hub 并非必需
     snapshot_download = None
 
 
+DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
+
+
 class _SentenceTransformerWrapper:
-    def __init__(self, model):
+    """统一 SentenceTransformer 与应用内 Embedder 的接口。"""
+
+    def __init__(self, model: Any):
         self.model = model
 
-    def encode(self, texts: List[str]):
+    def encode(self, texts: Sequence[str]):
         return self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+
 
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
+
 class OpenSearchImporter:
-    def __init__(self, host: str = 'localhost', port: int = 9200,
-                 username: str = None, password: str = None,
-                 use_ssl: bool = False, verify_certs: bool = False,
-                 ssl_assert_hostname: bool = True, ssl_show_warn: bool = True,
-                 timeout: int = 30,
-                 enable_vector: bool = False,
-                 vector_field: str = 'text_vector',
-                 vector_dimension: int = 512,
-                 embedding_model: Optional[str] = None,
-                 model_cache_dir: Optional[str] = None):
-        """初始化 OpenSearch 连接"""
-        
-        # 处理 AWS VPC 端点 URL
-        if host.startswith('http://') or host.startswith('https://'):
-            host = host.replace('https://', '').replace('http://', '')
-        
-        # OpenSearch 连接配置
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 9200,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        use_ssl: bool = False,
+        verify_certs: bool = False,
+        ssl_assert_hostname: bool = True,
+        ssl_show_warn: bool = True,
+        timeout: int = 30,
+        enable_vector: bool = False,
+        vector_field: str = "text_vector",
+        vector_dimension: int = 512,
+        embedding_model: Optional[str] = None,
+        model_cache_dir: Optional[str] = None,
+    ) -> None:
+        """初始化 OpenSearch 连接并准备向量写入。"""
+
+        if host.startswith("http://") or host.startswith("https://"):
+            host = host.replace("https://", "").replace("http://", "")
+
         self.config = {
-            'hosts': [{'host': host, 'port': port}],
-            'http_compress': True,
-            'use_ssl': use_ssl,
-            'verify_certs': verify_certs,
-            'ssl_assert_hostname': ssl_assert_hostname,
-            'ssl_show_warn': ssl_show_warn,
-            'timeout': timeout,
-            'max_retries': 3,
-            'retry_on_timeout': True,
+            "hosts": [{"host": host, "port": port}],
+            "http_compress": True,
+            "use_ssl": use_ssl,
+            "verify_certs": verify_certs,
+            "ssl_assert_hostname": ssl_assert_hostname,
+            "ssl_show_warn": ssl_show_warn,
+            "timeout": timeout,
+            "max_retries": 3,
+            "retry_on_timeout": True,
         }
-        
-        # 如果提供了认证信息
+
         if username and password:
-            self.config['http_auth'] = (username, password)
-        
+            self.config["http_auth"] = (username, password)
+
         try:
             self.client = OpenSearch(**self.config)
-            # 测试连接
             info = self.client.info()
-            logger.info(f"成功连接到 OpenSearch: {info['version']['number']}")
-        except Exception as e:
-            logger.error(f"连接 OpenSearch 失败: {e}")
+            self.server_version = info.get("version", {}).get("number", "unknown")
+            logger.info("成功连接到 OpenSearch: %s", self.server_version)
+        except Exception as exc:  # pragma: no cover - 连接失败时直接抛出
+            logger.error("连接 OpenSearch 失败: %s", exc)
             raise
 
         self.enable_vector = bool(enable_vector)
-        self.vector_field = vector_field if vector_field else None
+        self.vector_field = vector_field.strip() if vector_field else ""
         self.vector_dimension = vector_dimension
-        self.embedding_model = embedding_model
+        self.embedding_model = embedding_model.strip() if embedding_model else None
         self.model_cache_dir = model_cache_dir.strip() if model_cache_dir else None
-        self.embedder = None
+        self.embedder: Optional[Any] = None
         self._prepared_model_path: Optional[str] = None
-
-        if self.enable_vector and not self.vector_field:
-            logger.warning("未指定向量字段名称，已禁用语义向量写入功能")
-            self.enable_vector = False
 
         if self.model_cache_dir:
             self._configure_model_cache_env()
 
-        if self.enable_vector and self.vector_field:
-            self.embedder = self._load_embedder()
-            if self.embedder is not None:
-                logger.info(
-                    "已启用语义向量写入: 字段=%s, 维度=%s",
-                    self.vector_field,
-                    self.vector_dimension,
-                )
-            else:
-                logger.warning("未能加载向量模型，已自动关闭语义向量写入功能")
+        if self.enable_vector:
+            if not self.vector_field:
+                logger.warning("未指定向量字段名称，已禁用语义向量写入功能")
                 self.enable_vector = False
-    
+            else:
+                self.embedding_model = self.embedding_model or self._infer_embedding_model()
+                self.embedder = self._load_embedder()
+                if self.embedder is None:
+                    logger.warning("未能加载向量模型，已自动关闭语义向量写入功能")
+                    self.enable_vector = False
+                else:
+                    self._sync_vector_dimension()
+                    logger.info(
+                        "已启用语义向量写入: 字段=%s, 维度=%s, 模型=%s",
+                        self.vector_field,
+                        self.vector_dimension,
+                        self.embedding_model or "未知",
+                    )
+
+    # ------------------------------------------------------------------
+    # 模型准备相关工具
+    # ------------------------------------------------------------------
+    def _configure_model_cache_env(self) -> None:
+        os.makedirs(self.model_cache_dir, exist_ok=True)
+        os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", self.model_cache_dir)
+        os.environ.setdefault("HUGGINGFACE_HUB_CACHE", self.model_cache_dir)
+        logger.info("模型缓存目录: %s", self.model_cache_dir)
+
+    def _infer_embedding_model(self) -> str:
+        if self.embedding_model:
+            return self.embedding_model
+
+        if get_settings:
+            try:
+                settings = get_settings()
+                model_name = getattr(settings, "embedding_model", None)
+                if model_name:
+                    return model_name
+            except Exception as exc:  # pragma: no cover - 设置加载失败时降级
+                logger.debug("读取应用配置失败: %s", exc)
+
+        return DEFAULT_EMBEDDING_MODEL
+
+    def _prepare_model_snapshot(self, model_id: str) -> Optional[str]:
+        if snapshot_download is None:
+            return None
+
+        kwargs: Dict[str, Any] = {}
+        if self.model_cache_dir:
+            kwargs["cache_dir"] = self.model_cache_dir
+        token = os.getenv("HUGGINGFACEHUB_API_TOKEN") or os.getenv("HF_TOKEN")
+        if token:
+            kwargs["token"] = token
+
+        try:
+            local_dir = snapshot_download(
+                repo_id=model_id,
+                local_files_only=False,
+                resume_download=True,
+                **kwargs,
+            )
+            logger.info("已预下载模型 %s -> %s", model_id, local_dir)
+            return local_dir
+        except Exception as exc:
+            logger.warning("预下载模型失败（使用在线加载）: %s", exc)
+            return None
+
+    def _wrap_embedder(self, embedder: Any) -> Any:
+        if embedder is None:
+            return None
+        if hasattr(embedder, "encode"):
+            return embedder
+        return None
+
+    def _load_embedder(self) -> Optional[Any]:
+        # 优先复用 app.embedding 提供的缓存实例
+        if get_embedder is not None and not self.embedding_model:
+            try:
+                embedder = get_embedder()
+                logger.info("复用 app.embedding.get_embedder() 提供的模型实例")
+                inferred = self._detect_model_name(embedder)
+                if inferred:
+                    self.embedding_model = inferred
+                return self._wrap_embedder(embedder)
+            except Exception as exc:
+                logger.warning("加载应用内嵌入模型失败，将尝试直接加载: %s", exc)
+
+        model_name = self.embedding_model or self._infer_embedding_model()
+        if SentenceTransformer is None:
+            logger.warning("未安装 sentence_transformers，无法写入语义向量")
+            return None
+
+        if self._prepared_model_path is None:
+            self._prepared_model_path = self._prepare_model_snapshot(model_name)
+        load_path = self._prepared_model_path or model_name
+
+        try:
+            model = SentenceTransformer(load_path, trust_remote_code=True)
+            self.embedding_model = model_name
+            return _SentenceTransformerWrapper(model)
+        except Exception as exc:
+            logger.error("加载模型 %s 失败: %s", model_name, exc)
+            return None
+
+    def _detect_model_name(self, embedder: Any) -> Optional[str]:
+        candidate = getattr(embedder, "model", None)
+        if candidate is None:
+            return None
+        for attr in ("name_or_path", "model_name", "model_id"):
+            value = getattr(candidate, attr, None)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    def _sync_vector_dimension(self) -> None:
+        if self.embedder is None:
+            return
+
+        model = getattr(self.embedder, "model", None)
+        dimension = None
+        if model is not None:
+            getter = getattr(model, "get_sentence_embedding_dimension", None)
+            if callable(getter):
+                try:
+                    dimension = int(getter())
+                except Exception:  # pragma: no cover - 极端情况下尝试回退
+                    dimension = None
+
+        if dimension is None:
+            try:
+                probe = self.embedder.encode(["dimension probe"])
+                vector = self._normalize_vector_output(probe)
+                if vector:
+                    dimension = len(vector)
+            except Exception:
+                dimension = None
+
+        if dimension and dimension != self.vector_dimension:
+            logger.info(
+                "自动调整向量维度: 配置=%s, 模型=%s",
+                self.vector_dimension,
+                dimension,
+            )
+            self.vector_dimension = dimension
+
+    # ------------------------------------------------------------------
+    # 文本清洗 & 文档构建
+    # ------------------------------------------------------------------
     def clean_html_content(self, text: str) -> str:
-        """清理HTML内容"""
         if not text:
             return ""
-        
-        # 移除HTML标签
-        text = re.sub(r'<[^>]+>', '', text)
-        # 移除多余的空白字符
-        text = re.sub(r'\s+', ' ', text)
-        # 移除首尾空白
-        text = text.strip()
-        
-        return text
-    
+        text = re.sub(r"<[^>]+>", "", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
     def extract_symptoms_and_solution(self, search_content: str) -> Dict[str, str]:
-        """从search内容中提取故障现象和解决方案"""
         if not search_content:
             return {"symptoms": "", "solution": ""}
-        
-        # 清理HTML
+
         clean_content = self.clean_html_content(search_content)
-        
-        # 尝试提取故障现象（通常在开头）
+        sentences = [s for s in clean_content.split("。") if s]
+
         symptoms = ""
-        solution = ""
-        
-        # 按句号分割，取前几句作为故障现象
-        sentences = clean_content.split('。')
         if sentences:
-            # 取前2-3句作为故障现象
-            symptoms = '。'.join(sentences[:3]).strip()
-            if symptoms and not symptoms.endswith('。'):
-                symptoms += '。'
-        
-        # 查找解决方案关键词
-        solution_keywords = ['更换', '维修', '解决', '处理', '修复', '故障排除']
+            symptoms = "。".join(sentences[:3]).strip()
+            if symptoms and not symptoms.endswith("。"):
+                symptoms += "。"
+
+        solution = ""
+        solution_keywords = ["更换", "维修", "解决", "处理", "修复", "故障排除"]
         for sentence in sentences:
             if any(keyword in sentence for keyword in solution_keywords):
                 solution = sentence.strip()
                 break
-        
+
         return {
-            "symptoms": symptoms[:500] if symptoms else "",  # 限制长度
-            "solution": solution[:300] if solution else ""   # 限制长度
+            "symptoms": symptoms[:500] if symptoms else "",
+            "solution": solution[:300] if solution else "",
         }
-    
-    def transform_record(self, record: Dict[str, Any]) -> Dict[str, Any]:
-        """转换单条记录格式"""
-        source = record.get('_source', {})
-        
-        # 提取故障现象和解决方案
-        search_content = source.get('search', '')
+
+    def transform_record(self, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        source = record.get("_source") or {}
+        search_content = source.get("search", "")
         extracted = self.extract_symptoms_and_solution(search_content)
-        
-        # 构建新的文档结构
-        transformed = {
-            'id': record.get('_id', ''),
-            'vehicletype': source.get('vehicletype', ''),
-            'discussion': source.get('discussion', ''),
-            'symptoms': extracted['symptoms'],
-            'solution': extracted['solution'],
-            'search_content': self.clean_html_content(search_content)[:2000],  # 限制长度
-            'search_num': source.get('searchNum', 0),
-            'rate': source.get('rate'),
-            'vin': source.get('vin'),
-            'created_at': datetime.now().isoformat(),
-            'source_index': record.get('_index', ''),
-            'source_type': record.get('_type', '')
+
+        transformed: Dict[str, Any] = {
+            "id": record.get("_id", ""),
+            "vehicletype": source.get("vehicletype", ""),
+            "discussion": source.get("discussion", ""),
+            "symptoms": extracted.get("symptoms", ""),
+            "solution": extracted.get("solution", ""),
+            "search_content": self.clean_html_content(search_content)[:2000],
+            "search_num": source.get("searchNum", 0),
+            "rate": source.get("rate"),
+            "vin": source.get("vin"),
+            "created_at": datetime.now().isoformat(),
+            "source_index": record.get("_index", ""),
+            "source_type": record.get("_type", ""),
         }
-        
-        # 移除空值
-        return {k: v for k, v in transformed.items() if v is not None and v != ''}
 
-    def _load_embedder(self):
-        """加载向量模型"""
-        model_id = self._infer_model_id()
-        local_path = self._ensure_model_download(model_id)
-        if SentenceTransformer is not None:
-            load_target = local_path or model_id
-            try:
-                model = SentenceTransformer(load_target, trust_remote_code=True)
-                logger.info("已加载 embedding 模型: %s", model_id)
-                embedder = _SentenceTransformerWrapper(model)
-                self._sync_vector_dimension(embedder)
-                return embedder
-            except Exception as model_err:
-                logger.error(f"加载 SentenceTransformer 模型失败: {model_err}")
+        transformed = {
+            key: value
+            for key, value in transformed.items()
+            if value not in (None, "")
+        }
 
-        if get_embedder is not None:
-            try:
-                embedder = get_embedder()
-                self._sync_vector_dimension(embedder)
-                logger.info("已回退到应用内置 embedding 模型")
-                return embedder
-            except Exception as fallback_err:
-                logger.error(f"加载应用内置 embedding 模型失败: {fallback_err}")
-
-        logger.error("当前环境未能加载任何向量模型，无法写入 knn 向量")
-        return None
-
-    def _infer_model_id(self) -> str:
-        if self.embedding_model:
-            return self.embedding_model
-
-        config_spec = importlib.util.find_spec("app.config")
-        if config_spec is not None:
-            try:
-                config_module = importlib.import_module("app.config")
-                get_settings = getattr(config_module, "get_settings", None)
-                if callable(get_settings):
-                    settings = get_settings()
-                    candidate = getattr(settings, "embedding_model", None)
-                    if candidate:
-                        return str(candidate)
-            except Exception as cfg_err:
-                logger.debug("读取应用默认 embedding 模型失败: %s", cfg_err)
-
-        return "BAAI/bge-small-zh-v1.5"
-
-    def _configure_model_cache_env(self) -> None:
-        cache_root = os.path.abspath(self.model_cache_dir)
-        self.model_cache_dir = cache_root
-        os.makedirs(cache_root, exist_ok=True)
-        for env_key in ("SENTENCE_TRANSFORMERS_HOME", "HF_HOME"):
-            if not os.environ.get(env_key):
-                os.environ[env_key] = cache_root
-        logger.info("已将 embedding 模型缓存目录设置为: %s", cache_root)
-
-    def _ensure_model_download(self, model_id: str) -> Optional[str]:
-        if self._prepared_model_path:
-            return self._prepared_model_path
-
-        if snapshot_download is None:
-            logger.debug("huggingface_hub 未安装，跳过模型预下载")
+        if not transformed.get("id"):
+            logger.debug("记录缺少 id，已跳过: %s", record)
             return None
 
-        try:
-            download_kwargs = {"repo_id": model_id, "local_dir_use_symlinks": False}
-            cache_root = (
-                self.model_cache_dir
-                or os.environ.get("SENTENCE_TRANSFORMERS_HOME")
-                or os.environ.get("HF_HOME")
+        if self.enable_vector and self.embedder is not None:
+            text_for_vector = (
+                transformed.get("search_content")
+                or transformed.get("discussion")
+                or transformed.get("symptoms")
+                or ""
             )
-            target_dir = None
-            if cache_root:
-                cache_root = os.path.abspath(cache_root)
-                os.makedirs(cache_root, exist_ok=True)
-                sanitized = model_id.replace("/", "--")
-                target_dir = os.path.join(cache_root, sanitized)
-                os.makedirs(target_dir, exist_ok=True)
-                download_kwargs["local_dir"] = target_dir
+            vector = self._build_vector(text_for_vector)
+            if vector is not None:
+                transformed[self.vector_field] = vector
 
-            token = (
-                os.environ.get("HF_TOKEN")
-                or os.environ.get("HUGGINGFACE_TOKEN")
-                or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
-            )
-            if token:
-                download_kwargs["token"] = token
+        return transformed
 
-            local_path = snapshot_download(**download_kwargs)
-            logger.info("embedding 模型已准备就绪: %s", local_path)
-            self._prepared_model_path = local_path
-            return local_path
-        except Exception as download_err:
-            logger.warning("预下载 embedding 模型失败: %s", download_err)
+    def _normalize_vector_output(self, batch: Any) -> Optional[List[float]]:
+        if batch is None:
             return None
 
-    def _sync_vector_dimension(self, embedder: Any) -> None:
-        try:
-            preview = embedder.encode(["test"])
-        except Exception as encode_err:
-            raise RuntimeError(f"校验 embedding 模型输出失败: {encode_err}") from encode_err
+        if hasattr(batch, "tolist"):
+            batch = batch.tolist()
+        if not isinstance(batch, Iterable):
+            return None
 
-        if preview is None:
-            raise RuntimeError("embedding 模型未返回向量结果")
+        batch_list = list(batch)
+        if not batch_list:
+            return None
 
-        if hasattr(preview, "tolist"):
-            preview_list = preview.tolist()
+        first = batch_list[0]
+        if isinstance(first, Iterable) and not isinstance(first, (str, bytes)):
+            vector = list(first)
         else:
-            preview_list = list(preview)
+            vector = batch_list
 
-        if not preview_list:
-            raise RuntimeError("embedding 模型返回空向量")
+        try:
+            return [float(x) for x in vector]
+        except (TypeError, ValueError):
+            logger.warning("向量结果无法转换为 float: %s", vector)
+            return None
 
-        first_vector = preview_list[0] if isinstance(preview_list[0], (list, tuple)) else preview_list
-        actual_dim = len(first_vector)
-        if actual_dim != self.vector_dimension:
+    def _build_vector(self, text: str) -> Optional[List[float]]:
+        content = text.strip()
+        if not content:
+            return None
+        try:
+            batch = self.embedder.encode([content])
+        except Exception as exc:
+            logger.warning("生成语义向量失败: %s", exc)
+            return None
+
+        vector = self._normalize_vector_output(batch)
+        if vector is None:
+            return None
+
+        if self.vector_dimension and len(vector) != self.vector_dimension:
             logger.warning(
-                "模型输出维度(%s)与配置维度(%s)不一致，自动更新配置",
-                actual_dim,
+                "向量维度与配置不一致: got=%s expected=%s，将按模型输出更新配置",
+                len(vector),
                 self.vector_dimension,
             )
-            self.vector_dimension = int(actual_dim)
+            self.vector_dimension = len(vector)
 
-    @staticmethod
-    def _build_embedding_text(document: Dict[str, Any]) -> str:
-        """为向量模型准备文本"""
-        parts = [
-            document.get('symptoms', ''),
-            document.get('discussion', ''),
-            document.get('solution', ''),
-            document.get('search_content', ''),
-        ]
-        combined = '\n'.join(part for part in parts if part)
-        return combined.strip()
+        return vector
 
-    def _apply_vectors(self, documents: List[Dict[str, Any]], texts: List[Optional[str]]):
-        if not self.enable_vector or not self.embedder or not self.vector_field:
-            return
-
-        candidates: List[Tuple[int, str]] = [
-            (idx, text) for idx, text in enumerate(texts) if text
-        ]
-        if not candidates:
-            logger.info("没有可用于生成向量的文本")
-            return
-
-        indices, corpora = zip(*candidates)
-        try:
-            vectors = self.embedder.encode(list(corpora))
-        except Exception as e:
-            logger.error(f"批量生成向量失败: {e}")
-            return
-
-        try:
-            vectors_list = vectors.tolist()  # type: ignore[attr-defined]
-        except AttributeError:
-            vectors_list = [list(vec) for vec in vectors]
-
-        applied = 0
-        for doc_idx, vector in zip(indices, vectors_list):
-            if len(vector) != self.vector_dimension:
-                logger.warning(
-                    "文档 %s 的向量维度 %s 与配置 %s 不一致，已跳过",
-                    documents[doc_idx].get('_id'),
-                    len(vector),
-                    self.vector_dimension,
-                )
-                continue
-            documents[doc_idx]['_source'][self.vector_field] = vector
-            applied += 1
-
-        logger.info("已为 %s 条文档写入语义向量", applied)
-    
-    def create_index_mapping(self, index_name: str):
-        """创建索引映射 - 使用简化配置避免AWS限制"""
+    # ------------------------------------------------------------------
+    # 索引管理 & 导入流程
+    # ------------------------------------------------------------------
+    def create_index_mapping(self, index_name: str) -> bool:
         try:
             if self.client.indices.exists(index=index_name):
-                logger.info(f"索引 {index_name} 已存在")
+                logger.info("索引 %s 已存在", index_name)
+                if self.enable_vector:
+                    self._ensure_vector_compat(index_name)
                 return True
 
-            properties = {
-                "id": {"type": "keyword"},
-                "vehicletype": {
-                    "type": "text",
-                    "fields": {"keyword": {"type": "keyword"}}
-                },
-                "discussion": {"type": "text"},
-                "symptoms": {"type": "text"},
-                "solution": {"type": "text"},
-                "search_content": {"type": "text"},
-                "search_num": {"type": "integer"},
-                "rate": {"type": "float"},
-                "vin": {"type": "keyword"},
-                "created_at": {"type": "date"},
-                "source_index": {"type": "keyword"},
-                "source_type": {"type": "keyword"},
+            body: Dict[str, Any] = {
+                "mappings": {
+                    "properties": {
+                        "id": {"type": "keyword"},
+                        "vehicletype": {
+                            "type": "text",
+                            "fields": {"keyword": {"type": "keyword"}},
+                        },
+                        "discussion": {"type": "text"},
+                        "symptoms": {"type": "text"},
+                        "solution": {"type": "text"},
+                        "search_content": {"type": "text"},
+                        "search_num": {"type": "integer"},
+                        "rate": {"type": "float"},
+                        "vin": {"type": "keyword"},
+                        "created_at": {"type": "date"},
+                        "source_index": {"type": "keyword"},
+                        "source_type": {"type": "keyword"},
+                    }
+                }
             }
 
-            if self.enable_vector and self.vector_field:
-                properties[self.vector_field] = {
+            if self.enable_vector:
+                body.setdefault("settings", {})["index.knn"] = True
+                body["mappings"]["properties"][self.vector_field] = {
                     "type": "knn_vector",
                     "dimension": self.vector_dimension,
                     "method": {
@@ -407,211 +456,227 @@ class OpenSearchImporter:
                         "engine": "nmslib",
                         "parameters": {
                             "ef_construction": 128,
-                            "m": 16
+                            "m": 16,
+                        },
+                    },
+                }
+
+            self.client.indices.create(index=index_name, body=body)
+            logger.info("成功创建索引: %s", index_name)
+            return True
+        except Exception as exc:
+            logger.error("创建索引失败: %s", exc)
+            logger.info("尝试跳过索引创建，直接导入数据…")
+            return True
+
+    def _ensure_vector_compat(self, index_name: str) -> None:
+        try:
+            mappings = self.client.indices.get_mapping(index=index_name)
+            properties = mappings.get(index_name, {}).get("mappings", {}).get("properties", {})
+        except Exception as exc:
+            logger.warning("读取索引映射失败，无法校验向量字段: %s", exc)
+            return
+
+        vector_mapping = properties.get(self.vector_field)
+        if not vector_mapping:
+            try:
+                body = {
+                    "properties": {
+                        self.vector_field: {
+                            "type": "knn_vector",
+                            "dimension": self.vector_dimension,
+                            "method": {
+                                "name": "hnsw",
+                                "space_type": "cosinesimil",
+                                "engine": "nmslib",
+                                "parameters": {
+                                    "ef_construction": 128,
+                                    "m": 16,
+                                },
+                            },
                         }
                     }
                 }
+                self.client.indices.put_mapping(index=index_name, body=body)
+                logger.info("已在索引 %s 中添加缺失的向量字段 %s", index_name, self.vector_field)
+            except Exception as exc:
+                logger.warning(
+                    "无法在索引 %s 中添加向量字段 %s，已禁用向量写入: %s",
+                    index_name,
+                    self.vector_field,
+                    exc,
+                )
+                self.enable_vector = False
+                return
+        else:
+            dimension = vector_mapping.get("dimension")
+            if dimension and int(dimension) != self.vector_dimension:
+                logger.info(
+                    "索引已有向量字段，自动同步维度: %s -> %s",
+                    self.vector_dimension,
+                    dimension,
+                )
+                self.vector_dimension = int(dimension)
 
-            simple_mapping = {
-                "mappings": {
-                    "properties": properties
-                }
-            }
+        try:
+            settings = self.client.indices.get_settings(index=index_name)
+            index_settings = settings.get(index_name, {}).get("settings", {}).get("index", {})
+            knn_enabled = str(index_settings.get("knn", "false")).lower() in {"true", "1", "yes"}
+            if not knn_enabled:
+                logger.warning(
+                    "索引 %s 未开启 index.knn，向量查询可能失败，请手动开启",
+                    index_name,
+                )
+        except Exception:
+            pass
 
-            if self.enable_vector and self.vector_field:
-                simple_mapping["settings"] = {
-                    "index.knn": True,
-                    "index.knn.space_type": "cosinesimil"
-                }
+    def import_data(self, json_file: str, index_name: str, batch_size: int = 100) -> bool:
+        if not os.path.exists(json_file):
+            logger.error("数据文件不存在: %s", json_file)
+            return False
 
-            response = self.client.indices.create(index=index_name, body=simple_mapping)
-            logger.info(f"成功创建索引: {index_name}")
-            return True
-        except Exception as e:
-            logger.error(f"创建索引失败: {e}")
-            # 如果创建索引失败，尝试不创建索引，直接导入数据（让OpenSearch自动创建）
-            logger.info("尝试跳过索引创建，直接导入数据...")
-            return True  # 返回True继续执行
-    
-    def import_data(self, json_file: str, index_name: str, batch_size: int = 100):
-        """导入数据到 OpenSearch"""
-        
-        # 创建索引
+        if batch_size <= 0:
+            batch_size = 100
+
         if not self.create_index_mapping(index_name):
             return False
-        
-        try:
-            # 读取JSON文件
-            logger.info(f"读取文件: {json_file}")
-            with open(json_file, 'r', encoding='utf-8') as f:
-                data = []
-                for line_num, line in enumerate(f, 1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    
-                    try:
-                        record = json.loads(line)
-                        data.append(record)
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"第 {line_num} 行JSON解析失败: {e}")
-                        continue
-            
-            logger.info(f"成功读取 {len(data)} 条记录")
-            
-            # 转换数据格式
-            logger.info("转换数据格式...")
-            documents: List[Dict[str, Any]] = []
-            embedding_texts: List[Optional[str]] = [] if self.enable_vector else []
-            for record in data:
+
+        actions: List[Dict[str, Any]] = []
+        total = 0
+
+        for record in self._iter_records(json_file):
+            transformed = self.transform_record(record)
+            if not transformed:
+                continue
+
+            doc_id = transformed.get("id")
+            action = {
+                "_index": index_name,
+                "_id": doc_id,
+                "_source": transformed,
+            }
+            actions.append(action)
+
+            if len(actions) >= batch_size:
+                total += self._flush_bulk(actions)
+                actions = []
+
+        if actions:
+            total += self._flush_bulk(actions)
+
+        logger.info("成功导入 %s 条文档", total)
+        return True
+
+    def _iter_records(self, json_file: str) -> Iterable[Dict[str, Any]]:
+        with open(json_file, "r", encoding="utf-8") as handle:
+            for line_num, line in enumerate(handle, 1):
+                text = line.strip()
+                if not text:
+                    continue
                 try:
-                    transformed = self.transform_record(record)
-                    if transformed:
-                        if self.enable_vector:
-                            embedding_texts.append(self._build_embedding_text(transformed))
-                        # 构建bulk操作格式
-                        doc = {
-                            "_index": index_name,
-                            "_id": transformed.get('id'),
-                            "_source": transformed
-                        }
-                        documents.append(doc)
-                except Exception as e:
-                    logger.warning(f"转换记录失败: {e}")
+                    yield json.loads(text)
+                except json.JSONDecodeError as exc:
+                    logger.warning("第 %s 行 JSON 解析失败: %s", line_num, exc)
                     continue
 
-            logger.info(f"成功转换 {len(documents)} 条记录")
+    def _flush_bulk(self, actions: List[Dict[str, Any]]) -> int:
+        if not actions:
+            return 0
 
-            if self.enable_vector and documents:
-                logger.info("开始批量生成语义向量...")
-                self._apply_vectors(documents, embedding_texts)
-            
-            # 批量导入
-            logger.info("开始批量导入...")
-            success_count = 0
-            error_count = 0
-            
-            for i in range(0, len(documents), batch_size):
-                batch = documents[i:i + batch_size]
-                try:
-                    success, failed = bulk(
-                        self.client,
-                        batch,
-                        index=index_name,
-                        chunk_size=batch_size,
-                        request_timeout=60
-                    )
-                    success_count += success
-                    error_count += len(failed) if failed else 0
-                    
-                    logger.info(f"批次 {i//batch_size + 1}: 成功 {success} 条")
-                    
-                except Exception as e:
-                    logger.error(f"批量导入失败: {e}")
-                    error_count += len(batch)
-            
-            # 刷新索引
-            self.client.indices.refresh(index=index_name)
-            
-            logger.info(f"导入完成! 成功: {success_count}, 失败: {error_count}")
-            
-            # 验证导入结果
-            count_result = self.client.count(index=index_name)
-            actual_count = count_result['count']
-            logger.info(f"索引中实际文档数量: {actual_count}")
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"导入过程出错: {e}")
-            return False
-    
-    def search_test(self, index_name: str, query: str = "发动机"):
-        """测试搜索功能"""
         try:
-            search_body = {
+            success, errors = bulk(self.client, actions)
+            if errors:
+                logger.warning("Bulk 导入存在错误: %s", errors)
+            return success
+        except Exception as exc:
+            logger.error("批量导入失败: %s", exc)
+            return 0
+
+    def run_test_query(self, index_name: str, query_text: str = "发动机故障") -> None:
+        try:
+            body = {
+                "size": 5,
                 "query": {
                     "multi_match": {
-                        "query": query,
-                        "fields": ["symptoms^2", "discussion^1.5", "solution", "search_content"]
+                        "query": query_text,
+                        "fields": [
+                            "discussion^3",
+                            "symptoms^2",
+                            "solution",
+                            "search_content",
+                        ],
                     }
                 },
-                "size": 5
             }
-            
-            response = self.client.search(index=index_name, body=search_body)
-            
-            logger.info(f"搜索测试 '{query}' 结果:")
-            for hit in response['hits']['hits']:
-                source = hit['_source']
-                logger.info(f"  ID: {source.get('id', 'N/A')}")
-                logger.info(f"  车型: {source.get('vehicletype', 'N/A')}")
-                logger.info(f"  故障: {source.get('discussion', 'N/A')}")
-                logger.info(f"  评分: {hit['_score']}")
-                logger.info("  ---")
-                
-        except Exception as e:
-            logger.error(f"搜索测试失败: {e}")
 
-def main():
-    parser = argparse.ArgumentParser(description='导入汽车维修案例数据到 OpenSearch')
-    parser.add_argument('--file', '-f', required=True, help='JSON文件路径')
-    parser.add_argument('--index', '-i', default='automotive_cases', help='索引名称')
-    parser.add_argument('--host', default='localhost', help='OpenSearch主机')
-    parser.add_argument('--port', type=int, default=9200, help='OpenSearch端口')
-    parser.add_argument('--username', '-u', help='用户名')
-    parser.add_argument('--password', '-p', help='密码')
-    parser.add_argument('--ssl', action='store_true', help='使用SSL')
-    parser.add_argument('--batch-size', type=int, default=100, help='批量大小')
-    parser.add_argument('--enable-vector', action='store_true', help='写入语义向量并创建kNN索引')
-    parser.add_argument('--vector-field', default='text_vector', help='向量字段名称 (默认: text_vector)')
-    parser.add_argument('--vector-dim', type=int, default=512, help='向量维度 (默认: 512)')
-    parser.add_argument('--embedding-model', help='自定义 SentenceTransformer 模型名称')
-    parser.add_argument('--model-cache', help='自定义 embedding 模型缓存目录')
-    parser.add_argument('--test', action='store_true', help='导入后进行搜索测试')
+            response = self.client.search(index=index_name, body=body)
+            hits = response.get("hits", {}).get("hits", [])
+            logger.info("测试查询返回 %s 条结果", len(hits))
+            for idx, hit in enumerate(hits, 1):
+                source = hit.get("_source", {})
+                logger.info(
+                    "[%s] 讨论: %s | 现象: %s",
+                    idx,
+                    source.get("discussion", ""),
+                    source.get("symptoms", ""),
+                )
+        except Exception as exc:
+            logger.warning("测试查询失败: %s", exc)
 
-    args = parser.parse_args()
-    
-    try:
-        # 创建导入器
-        importer = OpenSearchImporter(
-            host=args.host,
-            port=args.port,
-            username=args.username,
-            password=args.password,
-            use_ssl=args.ssl,
-            enable_vector=args.enable_vector,
-            vector_field=args.vector_field,
-            vector_dimension=args.vector_dim,
-            embedding_model=args.embedding_model,
-            model_cache_dir=args.model_cache,
-        )
-        
-        # 导入数据
-        success = importer.import_data(
-            json_file=args.file,
-            index_name=args.index,
-            batch_size=args.batch_size
-        )
-        
-        if success:
-            logger.info("数据导入成功!")
-            
-            # 进行搜索测试
-            if args.test:
-                logger.info("进行搜索测试...")
-                importer.search_test(args.index, "发动机")
-                importer.search_test(args.index, "刹车")
-        else:
-            logger.error("数据导入失败!")
-            sys.exit(1)
-            
-    except KeyboardInterrupt:
-        logger.info("用户中断操作")
-        sys.exit(1)
-    except Exception as e:
-        logger.error(f"程序执行出错: {e}")
-        sys.exit(1)
 
-if __name__ == "__main__":
-    main()
+# ----------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="将 JSONL 数据导入 OpenSearch")
+    parser.add_argument("--file", "-f", required=True, help="JSON 行文件路径")
+    parser.add_argument("--index", "-i", default="automotive_cases", help="目标索引名称")
+    parser.add_argument("--host", default="localhost", help="OpenSearch 主机")
+    parser.add_argument("--port", type=int, default=9200, help="OpenSearch 端口")
+    parser.add_argument("--username", "-u", help="用户名")
+    parser.add_argument("--password", "-p", help="密码")
+    parser.add_argument("--ssl", action="store_true", help="使用 SSL 连接")
+    parser.add_argument("--verify-certs", action="store_true", help="验证 SSL 证书")
+    parser.add_argument("--batch-size", type=int, default=100, help="批量导入大小")
+    parser.add_argument("--timeout", type=int, default=30, help="请求超时 (秒)")
+
+    # 向量相关参数
+    parser.add_argument("--enable-vector", action="store_true", help="启用 knn_vector 写入")
+    parser.add_argument("--vector-field", default="text_vector", help="向量字段名称")
+    parser.add_argument("--vector-dim", type=int, default=512, help="向量维度")
+    parser.add_argument("--embedding-model", help="SentenceTransformer 模型 ID")
+    parser.add_argument("--model-cache", help="embedding 模型缓存目录")
+
+    parser.add_argument("--test", action="store_true", help="导入完成后执行一次示例查询")
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
+
+    importer = OpenSearchImporter(
+        host=args.host,
+        port=args.port,
+        username=args.username,
+        password=args.password,
+        use_ssl=args.ssl,
+        verify_certs=args.verify_certs,
+        timeout=args.timeout,
+        enable_vector=args.enable_vector,
+        vector_field=args.vector_field,
+        vector_dimension=args.vector_dim,
+        embedding_model=args.embedding_model,
+        model_cache_dir=args.model_cache,
+    )
+
+    success = importer.import_data(args.file, args.index, batch_size=args.batch_size)
+
+    if success and args.test:
+        importer.run_test_query(args.index)
+
+    return 0 if success else 1
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI 入口
+    sys.exit(main())

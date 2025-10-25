@@ -13,7 +13,8 @@ usage() {
 不指定参数时，脚本会尝试使用 $OPENSEARCH_DATA_FILE 或 ../data/servicingcase_last.json。
 可以通过环境变量自定义 OpenSearch 连接信息：
   OPENSEARCH_HOST, OPENSEARCH_PORT, OPENSEARCH_USERNAME, OPENSEARCH_PASSWORD,
-  OPENSEARCH_SSL, OPENSEARCH_INDEX, OPENSEARCH_BATCH_SIZE,
+  OPENSEARCH_SSL, OPENSEARCH_VERIFY_CERTS, OPENSEARCH_TIMEOUT,
+  OPENSEARCH_INDEX, OPENSEARCH_BATCH_SIZE,
   OPENSEARCH_VECTOR_FIELD, OPENSEARCH_VECTOR_DIM,
   EMBEDDING_MODEL, MODEL_CACHE_DIR, PYTHON_BIN。
 USAGE
@@ -38,6 +39,8 @@ INDEX=${OPENSEARCH_INDEX:-cases}
 USERNAME=${OPENSEARCH_USERNAME:-}
 PASSWORD=${OPENSEARCH_PASSWORD:-}
 SSL_FLAG=${OPENSEARCH_SSL:-false}
+VERIFY_CERTS=${OPENSEARCH_VERIFY_CERTS:-false}
+TIMEOUT=${OPENSEARCH_TIMEOUT:-30}
 BATCH_SIZE=${OPENSEARCH_BATCH_SIZE:-200}
 VECTOR_FIELD=${OPENSEARCH_VECTOR_FIELD:-text_vector}
 VECTOR_DIM=${OPENSEARCH_VECTOR_DIM:-512}
@@ -55,6 +58,7 @@ CMD=("${PYTHON_BIN}" "${SCRIPT_DIR}/import_to_opensearch.py"
   "--index" "${INDEX}"
   "--host" "${HOST}"
   "--port" "${PORT}"
+  "--timeout" "${TIMEOUT}"
   "--batch-size" "${BATCH_SIZE}"
   "--enable-vector"
   "--vector-field" "${VECTOR_FIELD}"
@@ -67,6 +71,14 @@ fi
 case "${SSL_FLAG}" in
   true|TRUE|True|1|yes|YES)
     CMD+=("--ssl")
+    ;;
+  *)
+    ;;
+esac
+
+case "${VERIFY_CERTS}" in
+  true|TRUE|True|1|yes|YES)
+    CMD+=("--verify-certs")
     ;;
   *)
     ;;
