@@ -569,8 +569,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return 0
 
 
-if __name__ == "__main__":  # pragma: no cover - CLI 入口
-    sys.exit(main())
 """
 将case_recovery.sql文件转换为phenomena_sample.jsonl格式的脚本
 symptoms字段 -> 故障现象
