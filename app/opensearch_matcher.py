@@ -452,6 +452,18 @@ class OpenSearchMatcher:
             )
         )
 
+    @staticmethod
+    def _should_disable_vector_field(error: Exception) -> bool:
+        message = str(error)
+        lower = message.lower()
+        keywords = [
+            "is not knn_vector type",
+            "not of type [knn_vector]",
+            "cannot run knn search on field",
+            "is not a knn_vector",
+        ]
+        return any(keyword in lower for keyword in keywords)
+
     def _encode_query(self, query: str) -> Optional[List[float]]:
         if not self.embedder:
             return None
@@ -626,6 +638,16 @@ class OpenSearchMatcher:
                                 )
                                 self._knn_query_style = 'nested'
                                 continue
+                            if self._should_disable_vector_field(knn_err):
+                                logger.error(
+                                    "语义检索失败: 向量字段 %s 未配置为 knn_vector, 已禁用语义检索: %s",
+                                    self.vector_field,
+                                    knn_err,
+                                )
+                                self.semantic_available = False
+                                effective_semantic = False
+                                knn_resp = None
+                                break
                             logger.error(f"语义检索失败: {knn_err}")
                             effective_semantic = False
                             knn_resp = None
