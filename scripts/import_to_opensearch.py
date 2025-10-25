@@ -74,6 +74,33 @@ class _SentenceTransformerWrapper:
         return self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
 
 
+# 为了复用应用内的向量模型工具，确保可以导入 app 模块
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+embedding_spec = importlib.util.find_spec("app.embedding")
+if embedding_spec is not None:
+    embedding_module = importlib.import_module("app.embedding")
+    get_embedder = getattr(embedding_module, "get_embedder", None)
+else:  # pragma: no cover - 离线导入脚本允许缺省模型
+    get_embedder = None
+
+sentence_spec = importlib.util.find_spec("sentence_transformers")
+if sentence_spec is not None:
+    sentence_module = importlib.import_module("sentence_transformers")
+    SentenceTransformer = getattr(sentence_module, "SentenceTransformer", None)
+else:  # pragma: no cover - 仅用于命令行导入
+    SentenceTransformer = None
+
+
+class _SentenceTransformerWrapper:
+    def __init__(self, model):
+        self.model = model
+
+    def encode(self, texts: List[str]):
+        return self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,

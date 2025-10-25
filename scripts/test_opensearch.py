@@ -4,6 +4,16 @@
 OpenSearch 搜索测试脚本
 """
 
+try:  # pragma: no cover - pytest may not be available during manual execution
+    import pytest
+except Exception:  # pragma: no cover - keep runtime lightweight when used as script
+    pytest = None
+
+if pytest is not None:  # pragma: no cover - applied only in automated test environments
+    pytestmark = pytest.mark.skip(
+        reason="Manual OpenSearch integration helper; excluded from automated pytest runs."
+    )
+
 import json
 import sys
 from opensearchpy import OpenSearch
