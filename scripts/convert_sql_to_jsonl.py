@@ -569,8 +569,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return 0
 
 
-# 旧版脚本的辅助函数，保留用于直接 SQL -> JSONL 的快速转换
-# symptoms 字段 -> 故障现象, discussion 字段 -> 故障点
+if __name__ == "__main__":  # pragma: no cover - CLI 入口
+    sys.exit(main())
+"""
+将case_recovery.sql文件转换为phenomena_sample.jsonl格式的脚本
+symptoms字段 -> 故障现象
+discussion字段 -> 故障点
+"""
+
+import re
+import json
+import html
+import math
+from typing import List, Dict, Optional, Any
 
 def clean_html_content(content: str) -> str:
     """清理HTML内容，提取纯文本"""
